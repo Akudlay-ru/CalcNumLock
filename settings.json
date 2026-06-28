@@ -1,0 +1,22 @@
+{
+  "opacity_pct": 67,
+  "pos_mode": "center",
+  "calc_hotkey_enabled": true,
+  "main_hotkey": "numlock",
+  "calc_pause_hotkey": "shift+num lock",
+  "main_hotkey_delay_sec": 0.05,
+  "auto_copy_on_enter": true,
+  "auto_copy_enter_delay_ms": 2,
+  "calc_history_path": "",
+  "session_pos": null,
+  "unit_mode": "copy",
+  "unit_auto_paste": true,
+  "unit_keep_menu_open": false,
+  "calc_custom_cmd": "__calcnumlock_builtin_standard__",
+  "hide_mode": "hide",
+  "interface_theme": "system",
+  "calc_group_digits": false,
+  "calc_clipboard_mode": "result",
+  "calc_custom_args": "",
+  "autostart_enabled": false
+}
