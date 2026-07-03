@@ -402,7 +402,7 @@ class StandardEngine:
         self._clear_history_marker_for_continuation()
         st = self.state
         current_value = self.formatter.parse(st.current_input)
-        source_label = self._current_label or self.formatter.format(current_value)
+        source_label = self._current_label or self._format_input(st.current_input)
         try:
             with localcontext() as ctx:
                 ctx.prec = ENGINE_PRECISION
@@ -524,7 +524,7 @@ class StandardEngine:
         if self._last_token_is("number") or self._last_token_is("rparen"):
             return
         value = self.formatter.parse(self.state.current_input)
-        label = self._current_label or self.formatter.format(value)
+        label = self._current_label or self._format_input(self.state.current_input)
         self._tokens.append(_Token("number", value, label))
         self.state.pending_operand = value
 
@@ -557,7 +557,7 @@ class StandardEngine:
         tokens = list(self._tokens)
         if not self._just_closed_paren and not self.state.is_new_input:
             value = self.formatter.parse(self.state.current_input)
-            label = self._current_label or self.formatter.format(value)
+            label = self._current_label or self._format_input(self.state.current_input)
             if not (tokens and tokens[-1].kind in ("number", "rparen")):
                 tokens.append(_Token("number", value, label))
         self.state.expression = self._tokens_to_label(tokens)
@@ -574,7 +574,7 @@ class StandardEngine:
             return
         self._clear_history_marker_for_continuation()
         current_value = self.formatter.parse(self.state.current_input)
-        arg_label = self._current_label or self.formatter.format(current_value)
+        arg_label = self._current_label or self._format_input(self.state.current_input)
         try:
             with localcontext() as ctx:
                 ctx.prec = ENGINE_PRECISION
@@ -621,12 +621,13 @@ class StandardEngine:
     def _format_input(self, raw: str) -> str:
         if raw in ("", "-"):
             return "0"
-        if raw.endswith("."):
-            int_part = raw.rstrip(".")
+        if "." in raw:
+            int_part, frac_part = raw.split(".", 1)
             sign = "-" if int_part.startswith("-") else ""
             digits = int_part.lstrip("-") or "0"
-            grouped = self.formatter._group(digits) if self.formatter.options.group_digits else digits
-            return f"{sign}{grouped}{self.formatter.options.decimal_separator}"
+            if self.formatter.options.group_digits:
+                digits = self.formatter._group(digits)
+            return f"{sign}{digits}{self.formatter.options.decimal_separator}{frac_part}"
         try:
             value = Decimal(raw)
         except InvalidOperation:
