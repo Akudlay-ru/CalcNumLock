@@ -1,4 +1,4 @@
-"""NumLockCalc 2026 Free Core release 9.0.1.
+"""NumLockCalc 2026 Free Core release 9.0.5.
 
 Free Core: быстрый локальный калькулятор для Windows, NumLock-hotkey,
 встроенный калькулятор, единицы измерения, буфер обмена, история и базовые
@@ -73,6 +73,12 @@ except Exception as _keyboard_exc:
     KEYBOARD_AVAILABLE = False
     KEYBOARD_IMPORT_ERROR = f"{type(_keyboard_exc).__name__}: {_keyboard_exc}"
 
+# WM_HOTKEY / NumLock native registration.
+WM_HOTKEY = 0x0312
+MOD_NOREPEAT = 0x4000
+HOTKEY_ID_CALC_TOGGLE = 0xBEEF
+VK_NUMLOCK = 0x90
+
 # Окончательно отвязываем процесс от консоли (если осталась)
 try:
     ctypes.windll.kernel32.FreeConsole()
@@ -132,10 +138,11 @@ LICENSE_VERIFIER_MODULE = "license_verifier"
 LICENSE_STRICT_VERIFICATION = True
 PAID_FORCE_SHOW_DAYS = (3, 7, 12)
 PRODUCT_DISPLAY_NAME = "NumLockCalc 2026"
-PRODUCT_VERSION_LABEL = "9.0.1"
-STARTUP_SHORTCUT_NAME = f"{PRODUCT_DISPLAY_NAME} 9.0.1.lnk"
+PRODUCT_VERSION_LABEL = "9.0.5"
+STARTUP_SHORTCUT_NAME = f"{PRODUCT_DISPLAY_NAME} 9.0.5.lnk"
 KEYBOARD_IDLE_RECOVERY_SEC = 30 * 60
 KEYBOARD_RECOVERY_POLL_MS = 60 * 1000
+NUMLOCK_RESTORE_DELAY_MS = 80
 LICENSE_REQUEST_YANDEX_FORM_URL = "https://forms.yandex.ru/u/6a1726ce505690503a9fa8c3"
 LICENSE_REQUEST_FIELD_DEFAULTS = {
     "product": "",
@@ -1909,6 +1916,8 @@ class CalcTrayApp(QWidget):
         self.launcher_apps = []
         self.launcher_hotkey_handles = []
         self.calc_hotkey_handles = []
+        self._native_calc_hotkey_id = None
+        self._native_hotkey_last_fire = 0.0
 
         # Способ скрытия калькулятора:
         #   "hide"  — SW_HIDE + WS_EX_TOOLWINDOW (живёт в памяти, taskbar чистый)
@@ -4188,6 +4197,24 @@ class CalcTrayApp(QWidget):
                     log(f"Power event: resume code={code}; scheduling hotkey recovery")
                     QTimer.singleShot(800, lambda: self._recover_hotkeys_after_resume("power_resume_800ms", force=True))
                     QTimer.singleShot(2500, lambda: self._recover_hotkeys_after_resume("power_resume_2500ms"))
+            elif msg.message == WM_HOTKEY:
+                try:
+                    if int(msg.wParam) == HOTKEY_ID_CALC_TOGGLE:
+                        now = time.time()
+                        if now - float(getattr(self, "_native_hotkey_last_fire", 0.0)) < 0.25:
+                            return True, 0
+                        self._native_hotkey_last_fire = now
+                        if not self.running:
+                            return True, 0
+                        if not self.calc_hotkey_enabled:
+                            return True, 0
+                        if not getattr(self, "_startup_ready", False):
+                            self._pending_startup_toggle = True
+                            return True, 0
+                        self._sig_toggle.emit()
+                        return True, 0
+                except Exception:
+                    return True, 0
             elif msg.message == WM_WTSSESSION_CHANGE:
                 code = int(msg.wParam)
                 if code in (WTS_SESSION_LOCK, WTS_CONSOLE_DISCONNECT, WTS_REMOTE_DISCONNECT):
@@ -4205,6 +4232,14 @@ class CalcTrayApp(QWidget):
         return super().nativeEvent(eventType, message)
 
     def _unregister_calc_hotkeys(self):
+        if getattr(self, "_native_calc_hotkey_id", None) is not None:
+            try:
+                hwnd = int(self.winId())
+                if hwnd:
+                    user32.UnregisterHotKey(wintypes.HWND(hwnd), int(self._native_calc_hotkey_id))
+            except Exception as e:
+                log(f"Unregister native calc hotkey failed: {e}")
+            self._native_calc_hotkey_id = None
         if not globals().get("KEYBOARD_AVAILABLE", True) or keyboard is None:
             self.calc_hotkey_handles = []
             return
@@ -4216,43 +4251,62 @@ class CalcTrayApp(QWidget):
         self.calc_hotkey_handles = []
 
     def _register_calc_hotkeys(self, primary_only: bool = False):
-        if not globals().get("KEYBOARD_AVAILABLE", True) or keyboard is None:
-            try:
-                log(f"Calc hotkeys skipped: keyboard unavailable: {globals().get('KEYBOARD_IMPORT_ERROR', '')}")
-            except Exception:
-                pass
-            return
         self._unregister_calc_hotkeys()
         main_hk = (getattr(self, "main_hotkey", "num lock") or "num lock").strip().lower()
         pause_hk = (getattr(self, "calc_pause_hotkey", "shift+num lock") or "shift+num lock").strip().lower()
+        keyboard_available = globals().get("KEYBOARD_AVAILABLE", True) and keyboard is not None
         used = set()
         if main_hk:
-            try:
-                h = keyboard.add_hotkey(
-                    main_hk,
-                    self._handle_calc_toggle_hotkey,
-                    suppress=False,
-                    trigger_on_release=False,
-                )
-                self.calc_hotkey_handles.append(h)
-                used.add(main_hk)
-                log(f"Calc toggle hotkey registered: {main_hk}")
-            except Exception as e:
-                log(f"Calc toggle hotkey register failed ({main_hk!r}): {e}")
+            keyboard_available = globals().get("KEYBOARD_AVAILABLE", True) and keyboard is not None
+            if main_hk == "num lock":
+                try:
+                    hwnd = int(self.winId())
+                    if hwnd and user32.RegisterHotKey(wintypes.HWND(hwnd), HOTKEY_ID_CALC_TOGGLE, MOD_NOREPEAT, VK_NUMLOCK):
+                        self._native_calc_hotkey_id = HOTKEY_ID_CALC_TOGGLE
+                        used.add(main_hk)
+                        log(f"Calc toggle native hotkey registered: {main_hk}")
+                    else:
+                        log(f"Calc toggle native hotkey register failed ({main_hk!r})")
+                except Exception as e:
+                    log(f"Calc toggle native hotkey register exception ({main_hk!r}): {e}")
+            if self._native_calc_hotkey_id is None and keyboard_available:
+                try:
+                    h = keyboard.add_hotkey(
+                        main_hk,
+                        self._handle_calc_toggle_hotkey,
+                        suppress=False,
+                        trigger_on_release=False,
+                    )
+                    self.calc_hotkey_handles.append(h)
+                    used.add(main_hk)
+                    log(f"Calc toggle hotkey registered: {main_hk}")
+                except Exception as e:
+                    log(f"Calc toggle hotkey register failed ({main_hk!r}): {e}")
+            elif self._native_calc_hotkey_id is None:
+                try:
+                    log(f"Calc toggle hotkey skipped: keyboard unavailable: {globals().get('KEYBOARD_IMPORT_ERROR', '')}")
+                except Exception:
+                    pass
         if primary_only:
             return
         if pause_hk and pause_hk not in used:
-            try:
-                h = keyboard.add_hotkey(
-                    pause_hk,
-                    self._handle_calc_pause_hotkey,
-                    suppress=False,
-                    trigger_on_release=False,
-                )
-                self.calc_hotkey_handles.append(h)
-                log(f"Calc pause hotkey registered: {pause_hk}")
-            except Exception as e:
-                log(f"Calc pause hotkey register failed ({pause_hk!r}): {e}")
+            if keyboard_available:
+                try:
+                    h = keyboard.add_hotkey(
+                        pause_hk,
+                        self._handle_calc_pause_hotkey,
+                        suppress=False,
+                        trigger_on_release=False,
+                    )
+                    self.calc_hotkey_handles.append(h)
+                    log(f"Calc pause hotkey registered: {pause_hk}")
+                except Exception as e:
+                    log(f"Calc pause hotkey register failed ({pause_hk!r}): {e}")
+            else:
+                try:
+                    log(f"Calc pause hotkey skipped: keyboard unavailable: {globals().get('KEYBOARD_IMPORT_ERROR', '')}")
+                except Exception:
+                    pass
 
     def _hotkey_delay_blocked(self) -> bool:
         now = time.time()
@@ -4265,6 +4319,10 @@ class CalcTrayApp(QWidget):
     def _handle_calc_toggle_hotkey(self):
         if not self.running:
             return
+        now = time.time()
+        if now - float(getattr(self, "_native_hotkey_last_fire", 0.0)) < 0.25:
+            return
+        self._native_hotkey_last_fire = now
         # При дефолтной паре num lock / shift+num lock не даём Shift+NumLock
         # одновременно вызвать и паузу, и открытие калькулятора.
         try:
@@ -5142,7 +5200,7 @@ class CalcTrayApp(QWidget):
         log(f"Toggle (mode={self.hide_mode})")
         if self._using_builtin_calc():
             self._toggle_builtin_calc()
-            QtCore.QTimer.singleShot(300, self._restore_numlock)
+            QtCore.QTimer.singleShot(NUMLOCK_RESTORE_DELAY_MS, self._restore_numlock)
             return
         hwnd = self._find_target_hwnd()
         if not hwnd:
@@ -5154,7 +5212,7 @@ class CalcTrayApp(QWidget):
             self._show(hwnd)
         else:
             self._hide(hwnd)
-        QtCore.QTimer.singleShot(300, self._restore_numlock)
+        QtCore.QTimer.singleShot(NUMLOCK_RESTORE_DELAY_MS, self._restore_numlock)
 
     def _wait_for_calc(self, ms: int = 200, attempts: int = 25):
         self._wait_n = attempts
@@ -5163,7 +5221,7 @@ class CalcTrayApp(QWidget):
             if hwnd:
                 log("Target window appeared")
                 self._show(hwnd)
-                QtCore.QTimer.singleShot(300, self._restore_numlock)
+                QtCore.QTimer.singleShot(NUMLOCK_RESTORE_DELAY_MS, self._restore_numlock)
             elif self._wait_n > 0:
                 self._wait_n -= 1
                 QtCore.QTimer.singleShot(ms, _check)
