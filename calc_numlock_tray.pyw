@@ -1,4 +1,4 @@
-"""NumLockCalc 2026 release 9.0.6.
+"""NumLockCalc 2026 release 9.0.7.
 
 Free core: встроенный калькулятор, NumLock-hotkey, единицы, буфер,
 история и базовые настройки.
@@ -180,8 +180,8 @@ MANAGED_WINDOWS_AVAILABLE = PRO_SECURE_AVAILABLE
 LICENSE_FILE = APP_ROOT / "license.txt"
 PAID_HIDE_HOURS = 2
 PRODUCT_DISPLAY_NAME = "NumLockCalc 2026"
-PRODUCT_VERSION_LABEL = "9.0.6"
-STARTUP_SHORTCUT_NAME = f"{PRODUCT_DISPLAY_NAME} 9.0.6.lnk"
+PRODUCT_VERSION_LABEL = "9.0.7"
+STARTUP_SHORTCUT_NAME = f"{PRODUCT_DISPLAY_NAME} 9.0.7.lnk"
 KEYBOARD_IDLE_RECOVERY_SEC = 30 * 60
 KEYBOARD_RECOVERY_POLL_MS = 60 * 1000
 NUMLOCK_RESTORE_DELAY_MS = 80
@@ -985,7 +985,7 @@ class SettingsDialog(QDialog):
         f.addRow(self.chk_calc_open_on_start)
 
         self.chk_calc_second_launch_shows_calc = QCheckBox("При повторном запуске exe показывать калькулятор без сообщения")
-        self.chk_calc_second_launch_shows_calc.setChecked(bool(getattr(self.app, "calc_second_launch_shows_calc", False)))
+        self.chk_calc_second_launch_shows_calc.setChecked(bool(getattr(self.app, "calc_second_launch_shows_calc", True)))
         self.chk_calc_second_launch_shows_calc.setToolTip("Удобно для ярлыка на рабочем столе или системной кнопки калькулятора.")
         f.addRow(self.chk_calc_second_launch_shows_calc)
 
@@ -2078,7 +2078,7 @@ class CalcTrayApp(QWidget):
         self.calc_custom_cmd  = ""
         self.calc_custom_args = ""
         self.calc_open_on_start = False
-        self.calc_second_launch_shows_calc = False
+        self.calc_second_launch_shows_calc = True
         self.calc_always_on_top = False
         self.calc_fixed_min_size = False
 
@@ -2090,7 +2090,7 @@ class CalcTrayApp(QWidget):
         self.calc_history_path = str(DEFAULT_CALC_HISTORY_FILE)
         self.calc_group_digits = False
         self.calc_open_on_start = False
-        self.calc_second_launch_shows_calc = False
+        self.calc_second_launch_shows_calc = True
         self.calc_always_on_top = False
         self.calc_fixed_min_size = False
         self.auto_copy_on_enter = False
@@ -2974,7 +2974,7 @@ class CalcTrayApp(QWidget):
         self.calc_history_path = str(data.get("calc_history_path", str(DEFAULT_CALC_HISTORY_FILE)) or str(DEFAULT_CALC_HISTORY_FILE))
         self.calc_group_digits = bool(data.get("calc_group_digits", False))
         self.calc_open_on_start = bool(data.get("calc_open_on_start", False))
-        self.calc_second_launch_shows_calc = bool(data.get("calc_second_launch_shows_calc", False))
+        self.calc_second_launch_shows_calc = bool(data.get("calc_second_launch_shows_calc", True))
         self.calc_always_on_top = bool(data.get("calc_always_on_top", False))
         self.calc_fixed_min_size = bool(data.get("calc_fixed_min_size", False))
         self.autostart_enabled = bool(data.get("autostart_enabled", False))
@@ -3075,7 +3075,7 @@ class CalcTrayApp(QWidget):
         self.calc_custom_cmd  = ""
         self.calc_custom_args = ""
         self.calc_open_on_start = False
-        self.calc_second_launch_shows_calc = False
+        self.calc_second_launch_shows_calc = True
         self.calc_always_on_top = False
         self.calc_fixed_min_size = False
         self.calc_clipboard_mode = CALC_CLIPBOARD_RESULT
@@ -5906,15 +5906,15 @@ def _ensure_single_instance() -> bool:
 def _second_launch_should_show_calc() -> bool:
     try:
         if not SETTINGS_FILE.exists():
-            return False
+            return True
         data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
-        return bool(data.get("calc_second_launch_shows_calc", False))
+        return bool(data.get("calc_second_launch_shows_calc", True))
     except Exception as e:
         try:
             log(f"second-launch setting read failed: {e}")
         except Exception:
             pass
-        return False
+        return True
 
 
 def _request_existing_instance_show_calc() -> bool:

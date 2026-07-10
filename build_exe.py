@@ -35,7 +35,7 @@ import zipfile
 from datetime import datetime
 from pathlib import Path
 
-APP_BASENAME = "NumLockCalc_2026_9.0.6_FREE_CORE_RELEASE"
+APP_BASENAME = "NumLockCalc_2026_9.0.7_FREE_CORE_RELEASE"
 ENTRY_FILE = "calc_numlock_tray.pyw"
 ICON_FILE = "calculator_icon.ico"
 

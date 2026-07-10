@@ -65,6 +65,13 @@ class TrayMenuThemeTests(unittest.TestCase):
         self.assertIn("_second_launch_should_show_calc()", main_source)
         self.assertIn("_request_existing_instance_show_calc()", main_source)
 
+    def test_second_launch_shows_calculator_by_default(self):
+        source = TRAY_SOURCE.read_text(encoding="utf-8")
+
+        self.assertIn('self.calc_second_launch_shows_calc = True', source)
+        self.assertIn('data.get("calc_second_launch_shows_calc", True)', source)
+        self.assertIn('getattr(self.app, "calc_second_launch_shows_calc", True)', source)
+
 
 if __name__ == "__main__":
     unittest.main()
