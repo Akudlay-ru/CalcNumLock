@@ -71,6 +71,8 @@ class TrayMenuThemeTests(unittest.TestCase):
         self.assertIn('self.calc_second_launch_shows_calc = True', source)
         self.assertIn('data.get("calc_second_launch_shows_calc", True)', source)
         self.assertIn('getattr(self.app, "calc_second_launch_shows_calc", True)', source)
+        self.assertIn('"calc_second_launch_shows_calc_user_set"', source)
+        self.assertIn('and data.get("calc_second_launch_shows_calc_user_set")', source)
 
 
 if __name__ == "__main__":

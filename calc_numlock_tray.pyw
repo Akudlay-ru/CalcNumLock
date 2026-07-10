@@ -2974,7 +2974,7 @@ class CalcTrayApp(QWidget):
         self.calc_history_path = str(data.get("calc_history_path", str(DEFAULT_CALC_HISTORY_FILE)) or str(DEFAULT_CALC_HISTORY_FILE))
         self.calc_group_digits = bool(data.get("calc_group_digits", False))
         self.calc_open_on_start = bool(data.get("calc_open_on_start", False))
-        self.calc_second_launch_shows_calc = bool(data.get("calc_second_launch_shows_calc", True))
+        self.calc_second_launch_shows_calc = _settings_second_launch_shows_calc(data)
         self.calc_always_on_top = bool(data.get("calc_always_on_top", False))
         self.calc_fixed_min_size = bool(data.get("calc_fixed_min_size", False))
         self.autostart_enabled = bool(data.get("autostart_enabled", False))
@@ -3027,6 +3027,7 @@ class CalcTrayApp(QWidget):
             "calc_group_digits": bool(getattr(self, "calc_group_digits", False)),
             "calc_open_on_start": bool(getattr(self, "calc_open_on_start", False)),
             "calc_second_launch_shows_calc": bool(getattr(self, "calc_second_launch_shows_calc", False)),
+            "calc_second_launch_shows_calc_user_set": True,
             "calc_always_on_top": bool(getattr(self, "calc_always_on_top", False)),
             "calc_fixed_min_size": bool(getattr(self, "calc_fixed_min_size", False)),
             "autostart_enabled": bool(self._is_startup_enabled()),
@@ -5903,12 +5904,19 @@ def _ensure_single_instance() -> bool:
         return True  # не блокируем запуск
 
 
+def _settings_second_launch_shows_calc(data: dict) -> bool:
+    value = data.get("calc_second_launch_shows_calc", True)
+    if value is False and data.get("calc_second_launch_shows_calc_user_set"):
+        return False
+    return bool(value if value is not False else True)
+
+
 def _second_launch_should_show_calc() -> bool:
     try:
         if not SETTINGS_FILE.exists():
             return True
         data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
-        return bool(data.get("calc_second_launch_shows_calc", True))
+        return _settings_second_launch_shows_calc(data)
     except Exception as e:
         try:
             log(f"second-launch setting read failed: {e}")
