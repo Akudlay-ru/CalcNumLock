@@ -1,9 +1,14 @@
-"""NumLockCalc 2026 Free Core release 9.0.5.
+"""NumLockCalc 2026 release 9.0.6.
 
-Free Core: быстрый локальный калькулятор для Windows, NumLock-hotkey,
-встроенный калькулятор, единицы измерения, буфер обмена, история и базовые
-настройки. Публичная сборка не содержит Pro-модулей, лицензирования,
-автозамены, дневника, скриншотов, трекера активности и окон в трей.
+Free core: встроенный калькулятор, NumLock-hotkey, единицы, буфер,
+история и базовые настройки.
+
+PRO Soft: ярлыки, быстрые заметки, префикс/суффикс результата,
+запуск своего exe.
+
+PRO Secure: автозамена, трекер, скриншоты, дневник, окна в трей.
+Временный доступ к Pro включается только при наличии license.txt в папке программы.
+Без license.txt Pro-модули не импортируются и не запускают hooks/hotkeys/timers.
 """
 
 import sys
@@ -24,6 +29,37 @@ from ctypes import wintypes
 from datetime import datetime, date, timedelta
 from pathlib import Path
 from typing import Optional
+from hotkey_registry import (
+    find_hotkey_conflicts,
+    has_hotkey_conflict,
+    normalize_hotkey,
+)
+from launcher_window_state import ACTION_ACTIVATE, ACTION_MINIMIZE, choose_launcher_action
+from menu_action_row import (
+    MENU_ACTION_CHECKBOX_WIDTH,
+    MENU_ACTION_ICON_SIZE,
+    MENU_ACTION_ROW_MARGINS,
+    MENU_ACTION_ROW_SPACING,
+    MENU_AFFIX_FIELD_WIDTH,
+    MENU_AUTOCOPY_BUTTON_WIDTH,
+    MENU_CONTROL_ROW_MARGINS,
+    MENU_CONTROL_ROW_SPACING,
+    MENU_NOTE_BUTTON_WIDTH,
+    MENU_NOTE_INPUT_WIDTH,
+    MENU_QUICK_BLOCK_HEIGHT,
+    MENU_QUICK_BLOCK_WIDTH,
+    MENU_QUICK_FIELD_WIDTH,
+    MENU_QUICK_MODE_WIDTH,
+    MENU_RESET_BUTTON_WIDTH,
+    MENU_SQUARE_BUTTON_SIZE,
+    auto_copy_mode_tooltip,
+    format_auto_copy_caption,
+    format_auto_copy_menu_label,
+    format_action_caption,
+)
+from note_send_modes import NOTE_SEND_MODE_OBSIDIAN, note_send_mode_options, normalize_note_send_mode
+from note_storage import write_note_entry
+from native_hotkeys import WM_HOTKEY, parse_native_hotkey, should_use_native_hotkey
 
 # ---------------------------------------------------------------------------
 # Профилирование запуска / диагностика зависаний
@@ -73,12 +109,6 @@ except Exception as _keyboard_exc:
     KEYBOARD_AVAILABLE = False
     KEYBOARD_IMPORT_ERROR = f"{type(_keyboard_exc).__name__}: {_keyboard_exc}"
 
-# WM_HOTKEY / NumLock native registration.
-WM_HOTKEY = 0x0312
-MOD_NOREPEAT = 0x4000
-HOTKEY_ID_CALC_TOGGLE = 0xBEEF
-VK_NUMLOCK = 0x90
-
 # Окончательно отвязываем процесс от консоли (если осталась)
 try:
     ctypes.windll.kernel32.FreeConsole()
@@ -94,7 +124,7 @@ from PyQt5.QtWidgets import (
     QWidget, QActionGroup, QDialog, QPushButton, QMessageBox,
     QLineEdit, QFileDialog, QInputDialog, QCheckBox,
     QTabWidget, QFormLayout, QSpinBox, QDoubleSpinBox, QGroupBox, QScrollArea,
-    QFrame, QComboBox, QRadioButton, QButtonGroup, QPlainTextEdit,
+    QFrame, QComboBox, QRadioButton, QButtonGroup, QPlainTextEdit, QGridLayout,
     QSizePolicy, QToolButton, QFileIconProvider, QTableWidget
 )
 
@@ -118,6 +148,20 @@ from functions import (
     _get_text, _get_class, _exe_basename_of_hwnd,
 )
 
+
+def _is_allowed_default_calc_hotkey_overlap(left_role, left_hk, right_role, right_hk) -> bool:
+    pair = {
+        (str(left_role), normalize_hotkey(left_hk)),
+        (str(right_role), normalize_hotkey(right_hk)),
+    }
+    return pair == {
+        ("Открыть / закрыть калькулятор", "num lock"),
+        ("Пауза обработки", "shift+num lock"),
+    } or pair == {
+        ("calc toggle", "num lock"),
+        ("calc pause", "shift+num lock"),
+    }
+
 # ---------------------------------------------------------------------------
 # Отложенные модули.
 #
@@ -129,20 +173,23 @@ pro_soft = None
 pro_secure = None
 extra = None
 managed_windows = None
-PRO_SOFT_AVAILABLE = False
-PRO_SECURE_AVAILABLE = False
-EXTRA_AVAILABLE = False
-MANAGED_WINDOWS_AVAILABLE = False
+PRO_SOFT_AVAILABLE = (APP_ROOT / "pro_soft.py").exists()
+PRO_SECURE_AVAILABLE = (APP_ROOT / "pro_secure.py").exists()
+EXTRA_AVAILABLE = PRO_SECURE_AVAILABLE
+MANAGED_WINDOWS_AVAILABLE = PRO_SECURE_AVAILABLE
 LICENSE_FILE = APP_ROOT / "license.txt"
-LICENSE_VERIFIER_MODULE = "license_verifier"
-LICENSE_STRICT_VERIFICATION = True
-PAID_FORCE_SHOW_DAYS = (3, 7, 12)
+PAID_HIDE_HOURS = 2
 PRODUCT_DISPLAY_NAME = "NumLockCalc 2026"
-PRODUCT_VERSION_LABEL = "9.0.5"
-STARTUP_SHORTCUT_NAME = f"{PRODUCT_DISPLAY_NAME} 9.0.5.lnk"
+PRODUCT_VERSION_LABEL = "9.0.6"
+STARTUP_SHORTCUT_NAME = f"{PRODUCT_DISPLAY_NAME} 9.0.6.lnk"
 KEYBOARD_IDLE_RECOVERY_SEC = 30 * 60
 KEYBOARD_RECOVERY_POLL_MS = 60 * 1000
 NUMLOCK_RESTORE_DELAY_MS = 80
+HWND_BROADCAST = 0xFFFF
+try:
+    WM_CALCNUMLOCK_SHOW_CALC = int(ctypes.windll.user32.RegisterWindowMessageW("CalcNumLock.ShowCalculator.v1"))
+except Exception:
+    WM_CALCNUMLOCK_SHOW_CALC = 0
 LICENSE_REQUEST_YANDEX_FORM_URL = "https://forms.yandex.ru/u/6a1726ce505690503a9fa8c3"
 LICENSE_REQUEST_FIELD_DEFAULTS = {
     "product": "",
@@ -398,32 +445,79 @@ class AboutDialog(QDialog):
         lay.addWidget(title)
 
         summary = QLabel(
-            "NumLockCalc 2026 Free Core — лёгкий локальный калькулятор для Windows: "
-            "быстрый вызов по NumLock, встроенный калькулятор, единицы измерения, "
-            "история и аккуратная работа с буфером обмена."
+            "Быстрый калькулятор и tray-инструмент для Windows: считать, копировать, "
+            "вставлять единицы, управлять окнами и не утонуть в мелких действиях."
         )
         summary.setWordWrap(True)
         lay.addWidget(summary)
 
         body = QLabel(
-            "<b>Что внутри Free Core</b><br>"
+            "<b>Free Core</b><br>"
             "• собственный встроенный калькулятор в стиле Win11;<br>"
-            "• нормальный математический движок: приоритет операций, проценты, скобки;<br>"
-            "• запуск и скрытие по NumLock без тяжёлого старта;<br>"
-            "• история вычислений и копирование результата;<br>"
-            "• меню единиц измерения, символов и строительных обозначений;<br>"
-            "• число → текст и быстрые вставки через трей.<br><br>"
-            "Сборка Free Core не содержит платных модулей, лицензий и фоновых Pro-функций. "
-            "Это публичная версия для публикации и свободной установки."
+            "• нормальный математический движок, проценты, скобки и история вычислений;<br>"
+            "• открытие по NumLock, быстрый отклик после запуска;<br>"
+            "• единицы измерения, символы, число → текст, автоматическое копирование результата;<br>"
+            "• быстрые вставки прямо из трея.<br><br>"
+            "<b>Pro Soft</b><br>"
+            "• ярлыки пользователя, быстрые и popup-заметки;<br>"
+            "• префиксы/суффиксы результата;<br>"
+            "• число → сумма: 100 500 → Сто тысяч пятьсот рублей 00 копеек;<br>"
+            "• запуск своего exe вместо встроенного калькулятора или calc.exe.<br><br>"
+            "<b>Pro Secure</b><br>"
+            "• автозамена: м2 → м², рубм2 → ₽/м², дельта → Δ, сумма → ∑, плюсминус → ±;<br>"
+            "• дневник ввода, трекер активности, скриншоты и окна в трей.<br><br>"
+            "Релизная версия: Pro-модули запускаются только после проверки лицензии. "
+            "Тяжёлые Pro-модули не должны мешать базовому калькулятору."
         )
         body.setWordWrap(True)
         body.setTextFormat(Qt.RichText)
         lay.addWidget(body)
 
+        status = "активна" if app and app._pro_license_active() else "не найдена"
+        lay.addWidget(QLabel(f"Лицензия Pro: {status}"))
+
+        if app is not None:
+            gb_req = QGroupBox("Заявка на Pro / код оборудования")
+            f_req = QFormLayout(gb_req)
+            self.le_hw_code = QLineEdit(app._get_hardware_code())
+            self.le_hw_code.setReadOnly(True)
+            self.le_hw_code.setCursorPosition(0)
+            f_req.addRow("Код оборудования:", self.le_hw_code)
+
+            row_req = QHBoxLayout()
+            b_copy = QPushButton("Копировать код")
+            b_copy.clicked.connect(self._copy_hw_code)
+            b_form = QPushButton("Открыть Яндекс Форму")
+            b_form.clicked.connect(self._open_license_form)
+            row_req.addWidget(b_copy)
+            row_req.addWidget(b_form)
+            row_req.addStretch()
+            row_req_w = QWidget()
+            row_req_w.setLayout(row_req)
+            f_req.addRow(row_req_w)
+
+            hint = QLabel(
+                "Лицензия проверяется по коду оборудования. "
+                "Код нужен для выпуска или перевыпуска Pro-лицензии."
+            )
+            hint.setWordWrap(True)
+            hint.setStyleSheet(LABEL_DIM)
+            f_req.addRow(hint)
+            lay.addWidget(gb_req)
+
+        if app is not None and not app._pro_license_active():
+            self.chk_show_paid = QCheckBox("Показать платные пункты")
+            self.chk_show_paid.setChecked(app._paid_items_visible())
+            self.chk_show_paid.toggled.connect(self._on_show_paid_toggled)
+            lay.addWidget(self.chk_show_paid)
+            hint = QLabel(app._paid_items_hint())
+            hint.setWordWrap(True)
+            lay.addWidget(hint)
+
         links = QLabel(
             "Автор: <a href='https://akudlay.ru'>Андрей Кудлай</a><br>"
             "Telegram автора: <a href='https://t.me/AKudlay_ru'>@AKudlay_ru</a><br>"
-            "Канал проекта: <a href='https://t.me/+2p1k8w4OiVowMGM6'>PM-Tools</a>"
+            "Канал проекта: <a href='https://t.me/+2p1k8w4OiVowMGM6'>КругоЗор</a>"
         )
         links.setTextFormat(Qt.RichText)
         links.setOpenExternalLinks(True)
@@ -723,6 +817,7 @@ class SettingsDialog(QDialog):
             self.tabs.addTab(self._scroll_tab(self._locked_tab("Окна в трей")), "🔒 Окна в трей")
 
         root.addWidget(self.tabs)
+        QTimer.singleShot(0, self._polish_settings_tables)
 
         btn_row = QHBoxLayout()
         b_reset = QPushButton("Сбросить все настройки")
@@ -802,6 +897,31 @@ class SettingsDialog(QDialog):
         scroll.setWidget(widget)
         return scroll
 
+    def _polish_settings_tables(self) -> None:
+        """Приводит таблицы настроек к текущей теме.
+
+        Pro Secure строит часть вкладок через адаптеры, поэтому таблицы могут
+        появиться уже после применения общего QSS. Без повторной полировки
+        QHeaderView/verticalHeader иногда остаются белыми в тёмной теме.
+        """
+        try:
+            for table in self.findChildren(QTableWidget):
+                try:
+                    table.setStyleSheet(SETTINGS_QSS)
+                    table.setAlternatingRowColors(False)
+                    table.setShowGrid(True)
+                    table.setCornerButtonEnabled(False)
+                    table.viewport().setStyleSheet(SETTINGS_QSS)
+                    if table.verticalHeader():
+                        table.verticalHeader().setVisible(False)
+                        table.verticalHeader().setStyleSheet(SETTINGS_QSS)
+                    if table.horizontalHeader():
+                        table.horizontalHeader().setStyleSheet(SETTINGS_QSS)
+                except Exception as e:
+                    log(f"Settings table polish failed: {e}")
+        except Exception as e:
+            log(f"Settings tables polish failed: {e}")
+
     # ----- Вкладка «Общие» -----
     def _build_general_tab(self) -> QWidget:
         w = QWidget()
@@ -863,6 +983,21 @@ class SettingsDialog(QDialog):
         self.chk_calc_open_on_start.setChecked(bool(getattr(self.app, "calc_open_on_start", False)))
         self.chk_calc_open_on_start.setToolTip("Для отдельного ярлыка можно также добавить аргумент --open-calc")
         f.addRow(self.chk_calc_open_on_start)
+
+        self.chk_calc_second_launch_shows_calc = QCheckBox("При повторном запуске exe показывать калькулятор без сообщения")
+        self.chk_calc_second_launch_shows_calc.setChecked(bool(getattr(self.app, "calc_second_launch_shows_calc", False)))
+        self.chk_calc_second_launch_shows_calc.setToolTip("Удобно для ярлыка на рабочем столе или системной кнопки калькулятора.")
+        f.addRow(self.chk_calc_second_launch_shows_calc)
+
+        self.chk_calc_always_on_top = QCheckBox("Поверх всех окон")
+        self.chk_calc_always_on_top.setChecked(bool(getattr(self.app, "calc_always_on_top", False)))
+        self.chk_calc_always_on_top.setToolTip("Держит окно калькулятора поверх остальных окон. Для стороннего calc.exe применяется при показе окна.")
+        f.addRow(self.chk_calc_always_on_top)
+
+        self.chk_calc_fixed_min_size = QCheckBox("Зафиксировать минимальный размер встроенного калькулятора")
+        self.chk_calc_fixed_min_size.setChecked(bool(getattr(self.app, "calc_fixed_min_size", False)))
+        self.chk_calc_fixed_min_size.setToolTip("Если включено, встроенный калькулятор остаётся в минимальном размере и не растягивается мышью.")
+        f.addRow(self.chk_calc_fixed_min_size)
 
         self.chk_autostart = QCheckBox("Автозапуск при входе в Windows (ярлык в папке Startup)")
         self.chk_autostart.setChecked(bool(self.app._is_startup_enabled()))
@@ -1311,6 +1446,18 @@ class SettingsDialog(QDialog):
         sb_row.addStretch()
         v3.addLayout(sb_row)
 
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("По умолчанию открывать:"))
+        self.cmb_note_popup_send_mode = QComboBox()
+        current_send_mode = normalize_note_send_mode(getattr(self.app, "note_popup_send_mode", NOTE_SEND_MODE_OBSIDIAN))
+        for label, mode in note_send_mode_options():
+            self.cmb_note_popup_send_mode.addItem(label, mode)
+            if mode == current_send_mode:
+                self.cmb_note_popup_send_mode.setCurrentIndex(self.cmb_note_popup_send_mode.count() - 1)
+        mode_row.addWidget(self.cmb_note_popup_send_mode)
+        mode_row.addStretch()
+        v3.addLayout(mode_row)
+
         lay.addWidget(gb3)
 
         lay.addStretch()
@@ -1589,12 +1736,55 @@ class SettingsDialog(QDialog):
             if close:
                 self.accept()
             return
+        next_main_hotkey = normalize_hotkey(self.le_main_hotkey.text()) or "num lock"
+        next_pause_hotkey = normalize_hotkey(self.le_calc_pause_hotkey.text()) or "shift+num lock"
+        next_launcher_apps = None
+        hotkey_entries = [
+            ("Открыть / закрыть калькулятор", next_main_hotkey),
+            ("Пауза обработки", next_pause_hotkey),
+        ]
+        if a._pro_soft_active() and hasattr(self, "le_note_popup_hotkey"):
+            next_note_popup_enabled = bool(self.chk_note_popup_enabled.isChecked())
+            next_note_popup_hotkey = normalize_hotkey(self.le_note_popup_hotkey.text()) or "ctrl+shift+n"
+            if next_note_popup_enabled:
+                hotkey_entries.append(("Быстрая заметка", next_note_popup_hotkey))
+            if hasattr(self, "launcher_rows"):
+                next_launcher_apps = self._collect_launcher_apps()
+                for item in next_launcher_apps:
+                    if item.get("enabled", True):
+                        hotkey_entries.append((
+                            f"Ярлык: {item.get('name') or item.get('path') or 'без названия'}",
+                            item.get("hotkey", ""),
+                        ))
+        conflicts = [
+            c for c in find_hotkey_conflicts(hotkey_entries)
+            if not _is_allowed_default_calc_hotkey_overlap(*c)
+        ]
+        if conflicts:
+            lines = [
+                f"{left_role} ({left_hk}) конфликтует с {right_role} ({right_hk})"
+                for left_role, left_hk, right_role, right_hk in conflicts[:6]
+            ]
+            if len(conflicts) > 6:
+                lines.append(f"...и ещё {len(conflicts) - 6}")
+            QMessageBox.warning(
+                self,
+                APP_NAME,
+                "Настройки хоткеев не сохранены: найдены пересекающиеся сочетания.\n\n"
+                + "\n".join(lines),
+            )
+            return
         # --- Общие ---
         a.calc_hotkey_enabled = self.chk_numlock_enabled.isChecked()
-        a.main_hotkey = self.le_main_hotkey.text().strip().lower() or "num lock"
-        a.calc_pause_hotkey = self.le_calc_pause_hotkey.text().strip().lower() or "shift+num lock"
+        a.main_hotkey = next_main_hotkey
+        a.calc_pause_hotkey = next_pause_hotkey
         a.main_hotkey_delay_sec = float(self.spn_main_delay.value())
         a.calc_open_on_start = bool(self.chk_calc_open_on_start.isChecked())
+        a.calc_second_launch_shows_calc = bool(getattr(self, "chk_calc_second_launch_shows_calc", None) and self.chk_calc_second_launch_shows_calc.isChecked())
+        a.calc_always_on_top = bool(getattr(self, "chk_calc_always_on_top", None) and self.chk_calc_always_on_top.isChecked())
+        a._apply_calc_topmost()
+        a.calc_fixed_min_size = bool(getattr(self, "chk_calc_fixed_min_size", None) and self.chk_calc_fixed_min_size.isChecked())
+        a._apply_builtin_calc_size_lock()
         if hasattr(self, "chk_autostart"):
             wanted_autostart = bool(self.chk_autostart.isChecked())
             if wanted_autostart != bool(a._is_startup_enabled()):
@@ -1701,8 +1891,7 @@ class SettingsDialog(QDialog):
             a._apply_interface_theme(rebuild=False)
             self.setStyleSheet(SETTINGS_QSS)
             try:
-                for _tbl in self.findChildren(QTableWidget):
-                    _tbl.setStyleSheet(SETTINGS_QSS)
+                self._polish_settings_tables()
                 for _scroll in self.findChildren(QScrollArea):
                     _scroll.setStyleSheet(SETTINGS_QSS)
             except Exception:
@@ -1727,15 +1916,16 @@ class SettingsDialog(QDialog):
             old_hotkey = a.note_popup_hotkey
             old_enabled = a.note_popup_enabled
             a.note_popup_enabled = self.chk_note_popup_enabled.isChecked()
-            a.note_popup_hotkey = self.le_note_popup_hotkey.text().strip().lower() or "ctrl+shift+n"
+            a.note_popup_hotkey = normalize_hotkey(self.le_note_popup_hotkey.text()) or "ctrl+shift+n"
             a.note_popup_submit = self.cmb_note_popup_submit.currentData() or "enter"
+            a.note_popup_send_mode = normalize_note_send_mode(self.cmb_note_popup_send_mode.currentData())
             if old_hotkey != a.note_popup_hotkey or old_enabled != a.note_popup_enabled:
                 try:
                     a._register_note_popup_hotkey()
                 except Exception:
                     pass
         if a._pro_soft_active() and hasattr(self, "launcher_rows"):
-            a.launcher_apps = self._collect_launcher_apps()
+            a.launcher_apps = next_launcher_apps if next_launcher_apps is not None else self._collect_launcher_apps()
         elif not a._pro_soft_active():
             a.launcher_apps = []
         try:
@@ -1869,8 +2059,6 @@ class CalcTrayApp(QWidget):
         self.calc_clipboard_mode = CALC_CLIPBOARD_RESULT
         self.auto_copy_mode = self.calc_clipboard_mode
         self.paid_hide_until = ""
-        self.paid_hide_count = 0
-        self.paid_hide_permanent = False
         self.money_text_parentheses = True
         self.money_text_kopecks_mode = "digits"
         self.amount_text_parentheses = True
@@ -1890,6 +2078,9 @@ class CalcTrayApp(QWidget):
         self.calc_custom_cmd  = ""
         self.calc_custom_args = ""
         self.calc_open_on_start = False
+        self.calc_second_launch_shows_calc = False
+        self.calc_always_on_top = False
+        self.calc_fixed_min_size = False
 
 
         # Рабочая клавиша и автокопирование результата
@@ -1899,6 +2090,9 @@ class CalcTrayApp(QWidget):
         self.calc_history_path = str(DEFAULT_CALC_HISTORY_FILE)
         self.calc_group_digits = False
         self.calc_open_on_start = False
+        self.calc_second_launch_shows_calc = False
+        self.calc_always_on_top = False
+        self.calc_fixed_min_size = False
         self.auto_copy_on_enter = False
         self.auto_copy_enter_delay_ms = 120
         self.auto_copy_prefix_enabled = False
@@ -1916,8 +2110,13 @@ class CalcTrayApp(QWidget):
         self.launcher_apps = []
         self.launcher_hotkey_handles = []
         self.calc_hotkey_handles = []
-        self._native_calc_hotkey_id = None
-        self._native_hotkey_last_fire = 0.0
+        self._native_hotkey_next_id = 0x4E43
+        self._native_hotkey_callbacks = {}
+        self._native_hotkey_roles = {}
+        self._native_hotkey_last_fire = {}
+        self._native_calc_hotkey_ids = []
+        self._native_launcher_hotkey_ids = []
+        self._native_note_hotkey_id = None
 
         # Способ скрытия калькулятора:
         #   "hide"  — SW_HIDE + WS_EX_TOOLWINDOW (живёт в памяти, taskbar чистый)
@@ -1945,6 +2144,7 @@ class CalcTrayApp(QWidget):
         self.note_popup_enabled = True
         self.note_popup_hotkey = "ctrl+shift+n"
         self.note_popup_submit = "enter"
+        self.note_popup_send_mode = NOTE_SEND_MODE_OBSIDIAN
         self._note_popup_dlg = None
         self._note_popup_hotkey_handle = None
 
@@ -1999,8 +2199,6 @@ class CalcTrayApp(QWidget):
         self.tray_windows_exclusions = {}
         self.tray_window_manager = None
         self.paid_hide_until = ""
-        self.paid_hide_count = 0
-        self.paid_hide_permanent = False
         self.autoreplace_enabled = True
         self.autoreplace_file = "autoreplace.txt"
         self.autoreplace_trigger_instant = True
@@ -2014,15 +2212,14 @@ class CalcTrayApp(QWidget):
         self._autoreplace_buffer = ""
         self._autoreplace_blocked = False
 
-        # Windows Startup / keyboard recovery / future license verification.
+        # Windows Startup / keyboard recovery / temporary Pro gate.
         self.autostart_enabled = False
         self._keyboard_on_press_hook = None
         self._keyboard_recovery_timer = None
         self._keyboard_last_recovery_ts = 0.0
         self._keyboard_idle_recovery_done = False
         self._session_notifications_registered = False
-        self._license_verifier_module = None
-        self._license_verifier_missing = False
+        self._paid_return_timer = None
         self._license_cache_stamp = None
         self._license_cache_at = 0.0
         self._license_cache_active = False
@@ -2044,6 +2241,7 @@ class CalcTrayApp(QWidget):
         self._startup_mark("START")
         self._startup_mark("SETTINGS_READY: load begin")
         self._load_settings()
+        self._schedule_paid_items_return()
         self.autostart_enabled = self._is_startup_enabled()
         if self._pro_soft_active() and self._ensure_pro_soft_loaded():
             try:
@@ -2160,83 +2358,96 @@ class CalcTrayApp(QWidget):
         except Exception:
             return None
 
-    def _load_license_verifier(self):
-        if bool(getattr(self, "_license_verifier_missing", False)):
-            return None
-        mod = getattr(self, "_license_verifier_module", None)
-        if mod is not None:
-            return mod
-        try:
-            mod = importlib.import_module(LICENSE_VERIFIER_MODULE)
-            self._license_verifier_module = mod
-            log(f"License verifier loaded: {LICENSE_VERIFIER_MODULE}")
-            return mod
-        except ModuleNotFoundError:
-            self._license_verifier_missing = True
-            return None
-        except Exception as e:
-            self._license_verifier_missing = True
-            log(f"License verifier import failed: {e}")
-            return None
-
-    def _normalize_license_result(self, result) -> bool:
-        if isinstance(result, bool):
-            return result
-        if isinstance(result, dict):
-            for key in ("active", "valid", "ok", "enabled"):
-                if key in result:
-                    return bool(result.get(key))
-            return False
-        if isinstance(result, (tuple, list)) and result:
-            return bool(result[0])
-        return bool(result)
-
-    def _verify_license_with_module(self, verifier) -> bool:
-        fn = None
-        for name in ("verify_license", "verify", "is_license_valid"):
-            candidate = getattr(verifier, name, None)
-            if callable(candidate):
-                fn = candidate
-                break
-        if fn is None:
-            log("License verifier has no verify_license/verify/is_license_valid function")
-            return False if LICENSE_STRICT_VERIFICATION else True
-        try:
-            result = fn(
-                license_path=str(LICENSE_FILE),
-                hardware_code=self._get_hardware_code(),
-                product=PRODUCT_DISPLAY_NAME,
-                version=PRODUCT_VERSION_LABEL,
-                app_root=str(APP_ROOT),
-            )
-            return self._normalize_license_result(result)
-        except TypeError:
-            try:
-                result = fn(str(LICENSE_FILE), self._get_hardware_code())
-                return self._normalize_license_result(result)
-            except Exception as e:
-                log(f"License verifier call failed: {e}")
-        except Exception as e:
-            log(f"License verifier call failed: {e}")
-        return False if LICENSE_STRICT_VERIFICATION else True
-
     def _pro_license_active(self) -> bool:
-        return False
+        stamp = self._license_file_stamp()
+        active = stamp is not None
+        self._license_cache_stamp = stamp
+        self._license_cache_at = time.monotonic()
+        self._license_cache_active = active
+        self._license_cache_source = "license.txt" if active else "missing"
+        self._license_cache_message = "license.txt found" if active else "license.txt not found"
+        return active
+
+    def _paid_hide_until_dt(self):
+        until = str(getattr(self, "paid_hide_until", "") or "")
+        if not until:
+            return None
+        try:
+            return datetime.fromisoformat(until)
+        except Exception:
+            self.paid_hide_until = ""
+            return None
+
+    def _paid_items_hidden_now(self) -> bool:
+        if self._pro_license_active():
+            return False
+        dt = self._paid_hide_until_dt()
+        if dt is None:
+            return False
+        if datetime.now() >= dt:
+            self.paid_hide_until = ""
+            return False
+        return True
+
+    def _schedule_paid_items_return(self) -> None:
+        try:
+            old = getattr(self, "_paid_return_timer", None)
+            if old is not None:
+                old.stop()
+                old.deleteLater()
+        except Exception:
+            pass
+        self._paid_return_timer = None
+        if self._pro_license_active():
+            return
+        dt = self._paid_hide_until_dt()
+        if dt is None:
+            return
+        delay_ms = int((dt - datetime.now()).total_seconds() * 1000)
+        if delay_ms <= 0:
+            self.paid_hide_until = ""
+            self._save_settings()
+            self._rebuild_tray_ui()
+            return
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        timer.timeout.connect(self._on_paid_hide_expired)
+        timer.start(min(delay_ms, 24 * 60 * 60 * 1000))
+        self._paid_return_timer = timer
+
+    def _on_paid_hide_expired(self) -> None:
+        if not self._paid_items_hidden_now():
+            self.paid_hide_until = ""
+            self._save_settings()
+            self._rebuild_tray_ui()
 
     def _pro_soft_active(self) -> bool:
-        return False
+        return bool(PRO_SOFT_AVAILABLE and self._pro_license_active())
 
     def _pro_secure_active(self) -> bool:
-        return False
+        return bool(PRO_SECURE_AVAILABLE and self._pro_license_active())
 
     def _paid_items_visible(self) -> bool:
-        return False
+        if self._pro_license_active():
+            return True
+        return not self._paid_items_hidden_now()
 
     def _paid_items_hint(self) -> str:
-        return "Публичная сборка Free Core не содержит платных пунктов."
+        if self._pro_license_active():
+            return "Pro-функции активны."
+        dt = self._paid_hide_until_dt()
+        if dt and datetime.now() < dt:
+            return f"Платные пункты скрыты до {dt.strftime('%d.%m.%Y %H:%M')}. Потом они вернутся автоматически."
+        return f"Если снять галку, платные пункты скроются на {PAID_HIDE_HOURS} часа."
 
     def _set_paid_items_visible(self, visible: bool) -> None:
-        return None
+        if visible:
+            self.paid_hide_until = ""
+        else:
+            self.paid_hide_until = (datetime.now() + timedelta(hours=PAID_HIDE_HOURS)).isoformat(timespec="seconds")
+        self._save_settings()
+        self._schedule_paid_items_return()
+        self._rebuild_tray_ui()
 
     def _startup_folder(self) -> Optional[Path]:
         if not sys.platform.startswith("win"):
@@ -2348,7 +2559,7 @@ class CalcTrayApp(QWidget):
         return bool(ok)
 
     def _get_product_edition(self) -> str:
-        return "Free Core"
+        return "Pro" if self._pro_license_active() else "Free"
 
     def _get_hardware_code(self) -> str:
         """Стабильный короткий код оборудования для заявки на Pro.
@@ -2424,13 +2635,23 @@ class CalcTrayApp(QWidget):
     def _show_pro_locked_popup(self, feature: str = "Эта функция") -> None:
         if self._pro_license_active():
             return
-        # Платный пункт не запускает отдельный popup. Открываем «О программе»,
-        # там пользователь сам управляет галкой показа платных пунктов.
         try:
-            dlg = AboutDialog(self)
-            dlg.exec_()
+            msg = QMessageBox(self)
+            msg.setIcon(QMessageBox.Information)
+            msg.setWindowTitle("Pro-функция")
+            msg.setText(f"{feature} доступна только при наличии license.txt.")
+            msg.setInformativeText("Платные пункты можно временно скрыть из меню на 2 часа.")
+            btn_hide = msg.addButton("Скрыть на 2 часа", QMessageBox.AcceptRole)
+            btn_request = msg.addButton("Заявка на Pro", QMessageBox.ActionRole)
+            msg.addButton("Оставить", QMessageBox.RejectRole)
+            msg.exec_()
+            clicked = msg.clickedButton()
+            if clicked is btn_hide:
+                self._set_paid_items_visible(False)
+            elif clicked is btn_request:
+                self._open_license_request_form()
         except Exception as e:
-            log(f"Open About from locked Pro item failed: {e}")
+            log(f"Locked Pro popup failed: {e}")
 
     def _locked_action(self, text: str, feature: str | None = None) -> QAction:
         act = QAction(f"🔒 {text}", self)
@@ -2753,6 +2974,9 @@ class CalcTrayApp(QWidget):
         self.calc_history_path = str(data.get("calc_history_path", str(DEFAULT_CALC_HISTORY_FILE)) or str(DEFAULT_CALC_HISTORY_FILE))
         self.calc_group_digits = bool(data.get("calc_group_digits", False))
         self.calc_open_on_start = bool(data.get("calc_open_on_start", False))
+        self.calc_second_launch_shows_calc = bool(data.get("calc_second_launch_shows_calc", False))
+        self.calc_always_on_top = bool(data.get("calc_always_on_top", False))
+        self.calc_fixed_min_size = bool(data.get("calc_fixed_min_size", False))
         self.autostart_enabled = bool(data.get("autostart_enabled", False))
         sp = data.get("session_pos")
         if isinstance(sp, list) and len(sp) == 2:
@@ -2767,11 +2991,6 @@ class CalcTrayApp(QWidget):
         self.calc_custom_cmd  = str(data.get("calc_custom_cmd", "") or "")
         self.calc_custom_args = str(data.get("calc_custom_args", "") or "")
         self.paid_hide_until = str(data.get("paid_hide_until", "") or "")
-        try:
-            self.paid_hide_count = max(0, int(data.get("paid_hide_count", 0) or 0))
-        except Exception:
-            self.paid_hide_count = 0
-        self.paid_hide_permanent = bool(data.get("paid_hide_permanent", False))
         # Способ скрытия
         hm = str(data.get("hide_mode", "hide"))
         self.hide_mode = hm if hm in ("hide", "close") else "hide"
@@ -2807,6 +3026,9 @@ class CalcTrayApp(QWidget):
             "calc_history_path": self.calc_history_path,
             "calc_group_digits": bool(getattr(self, "calc_group_digits", False)),
             "calc_open_on_start": bool(getattr(self, "calc_open_on_start", False)),
+            "calc_second_launch_shows_calc": bool(getattr(self, "calc_second_launch_shows_calc", False)),
+            "calc_always_on_top": bool(getattr(self, "calc_always_on_top", False)),
+            "calc_fixed_min_size": bool(getattr(self, "calc_fixed_min_size", False)),
             "autostart_enabled": bool(self._is_startup_enabled()),
             "session_pos": list(self.session_pos) if self.session_pos else None,
             "unit_mode": self.unit_mode,
@@ -2814,8 +3036,6 @@ class CalcTrayApp(QWidget):
             "unit_keep_menu_open": self.unit_keep_menu_open,
             "calc_custom_cmd": self.calc_custom_cmd if self.calc_custom_cmd in ("", BUILTIN_CALC_CMD) else "",
             "paid_hide_until": getattr(self, "paid_hide_until", ""),
-            "paid_hide_count": int(getattr(self, "paid_hide_count", 0) or 0),
-            "paid_hide_permanent": bool(getattr(self, "paid_hide_permanent", False)),
             "hide_mode": self.hide_mode,
             "interface_theme": normalize_theme_mode(getattr(self, "interface_theme", THEME_SYSTEM)),
             "license_request": {
@@ -2855,6 +3075,9 @@ class CalcTrayApp(QWidget):
         self.calc_custom_cmd  = ""
         self.calc_custom_args = ""
         self.calc_open_on_start = False
+        self.calc_second_launch_shows_calc = False
+        self.calc_always_on_top = False
+        self.calc_fixed_min_size = False
         self.calc_clipboard_mode = CALC_CLIPBOARD_RESULT
         self.auto_copy_mode = self.calc_clipboard_mode
         self.money_text_parentheses = True
@@ -3405,23 +3628,6 @@ class CalcTrayApp(QWidget):
     # ------------------------------------------------------------------
     # Быстрые заметки
     # ------------------------------------------------------------------
-    @staticmethod
-    def _rtf_escape(s: str) -> str:
-        out = []
-        for ch in s:
-            if ch in ('\\', '{', '}'):
-                out.append('\\' + ch)
-            elif ch == '\n':
-                out.append('\\line ')
-            elif ord(ch) < 128:
-                out.append(ch)
-            else:
-                code = ord(ch)
-                if code > 32767:
-                    code -= 65536
-                out.append(f'\\u{code}?')
-        return ''.join(out)
-
     def _append_note(self, text: str):
         if not self._pro_soft_active():
             self._show_pro_locked_popup("Быстрая заметка")
@@ -3435,41 +3641,14 @@ class CalcTrayApp(QWidget):
             ts = datetime.now().strftime("%Y-%m-%d %H:%M")
             fmt = self.notes_format
 
-            line_content = f"{ts}{self.notes_separator}{text}"
-            if fmt == NOTE_FMT_MD:
-                line = f"- {line_content}\n"
-            elif fmt == NOTE_FMT_TXT:
-                line = f"{line_content}\n"
-            elif fmt == NOTE_FMT_RTF:
-                entry = self._rtf_escape(line_content) + "\\line\n"
-            else:
-                return False
-
-            prepend_newline = False
-            if self.notes_newline_before and path.exists() and path.stat().st_size > 0:
-                prepend_newline = True
-
-            if fmt == NOTE_FMT_RTF:
-                if path.exists():
-                    content = path.read_text(encoding="utf-8", errors="ignore")
-                    idx = content.rfind('}')
-                    if idx > 0:
-                        if prepend_newline:
-                            entry = "\\line\n" + entry
-                        new_content = content[:idx] + entry + content[idx:]
-                    else:
-                        new_content = content + entry
-                    path.write_text(new_content, encoding="utf-8")
-                else:
-                    header = ('{\\rtf1\\ansi\\ansicpg1251\\deff0'
-                              '{\\fonttbl{\\f0\\fnil\\fcharset204 Segoe UI;}}'
-                              '\\f0\\fs22\n')
-                    path.write_text(header + entry + '}', encoding="utf-8")
-            else:
-                with open(path, "a", encoding="utf-8") as f:
-                    if prepend_newline:
-                        f.write("\n")
-                    f.write(line)
+            write_note_entry(
+                path=path,
+                text=text,
+                notes_format=fmt,
+                separator=self.notes_separator,
+                newline_before=bool(self.notes_newline_before),
+                timestamp=ts,
+            )
 
             try:
                 self.tray.showMessage(
@@ -3627,17 +3806,116 @@ class CalcTrayApp(QWidget):
         self.tray.activated.connect(self._on_tray_activated)
         self.tray.show()
 
+    def _menu_label_qss(self) -> str:
+        try:
+            palette = app_styles.active_palette(getattr(self, "interface_theme", THEME_SYSTEM))
+            return f"color: {palette.text_primary}; background: transparent;"
+        except Exception:
+            return "background: transparent;"
+
+    def _apply_menu_theme_tree(self, menu):
+        if menu is None:
+            return
+        try:
+            menu.setStyleSheet(MENU_QSS)
+        except Exception:
+            return
+        try:
+            actions = list(menu.actions())
+        except Exception:
+            actions = []
+        for action in actions:
+            try:
+                submenu = action.menu()
+            except Exception:
+                submenu = None
+            if submenu is not None:
+                self._apply_menu_theme_tree(submenu)
+
+    def _add_menu_action_row(self, menu, *, icon, title: str, hotkey: str, checked: bool, on_checked=None, on_trigger=None):
+        container = QWidget()
+        container.setStyleSheet(TRANSPARENT_BG)
+        outer = QHBoxLayout(container)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        row = QWidget()
+        row.setStyleSheet(TRANSPARENT_BG)
+        row.setCursor(Qt.PointingHandCursor)
+        row.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(*MENU_ACTION_ROW_MARGINS)
+        layout.setSpacing(MENU_ACTION_ROW_SPACING)
+        layout.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+
+        checkbox = QCheckBox()
+        checkbox.setChecked(bool(checked))
+        checkbox.setStyleSheet(MENU_CHECKBOX_QSS)
+        checkbox.setCursor(Qt.PointingHandCursor)
+        checkbox.setFixedWidth(MENU_ACTION_CHECKBOX_WIDTH)
+        checkbox.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        if on_checked is not None:
+            checkbox.toggled.connect(on_checked)
+        layout.addWidget(checkbox, 0, Qt.AlignLeft | Qt.AlignVCenter)
+
+        icon_label = QLabel()
+        icon_label.setFixedSize(MENU_ACTION_ICON_SIZE, MENU_ACTION_ICON_SIZE)
+        icon_label.setCursor(Qt.PointingHandCursor)
+        try:
+            if icon is not None and not icon.isNull():
+                icon_label.setPixmap(icon.pixmap(16, 16))
+        except Exception:
+            pass
+        layout.addWidget(icon_label, 0, Qt.AlignLeft | Qt.AlignVCenter)
+
+        caption = QLabel(format_action_caption(title, hotkey))
+        caption.setStyleSheet(self._menu_label_qss())
+        caption.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        caption.setCursor(Qt.PointingHandCursor)
+        layout.addWidget(caption, 0, Qt.AlignLeft | Qt.AlignVCenter)
+
+        outer.addWidget(row, 0, Qt.AlignLeft | Qt.AlignVCenter)
+
+        tooltip = f"Горячая клавиша: {hotkey}" if str(hotkey or "").strip() else ""
+        if tooltip:
+            container.setToolTip(tooltip)
+            row.setToolTip(tooltip)
+            icon_label.setToolTip(tooltip)
+            caption.setToolTip(tooltip)
+
+        def _trigger(_event=None):
+            if on_trigger is not None:
+                on_trigger()
+                try:
+                    menu.close()
+                except Exception:
+                    pass
+
+        row.mouseReleaseEvent = _trigger
+        icon_label.mouseReleaseEvent = _trigger
+        caption.mouseReleaseEvent = _trigger
+
+        action = QWidgetAction(self)
+        action.setDefaultWidget(container)
+        menu.addAction(action)
+        return action, checkbox
+
     def _build_main_menu(self, minimal: bool = False, update_state: bool = True) -> QMenu:
         if update_state:
             self._tray_full_menu_built = not bool(minimal)
         menu = QMenu(self)
         menu.setStyleSheet(MENU_QSS)
 
-        # --- Показать / скрыть калькулятор ---
-        act_show = QAction(f"Показать / скрыть калькулятор\t{self.main_hotkey}", self)
-        act_show.setIcon(self._icon())
-        act_show.triggered.connect(self._do_toggle)
-        menu.addAction(act_show)
+        # --- Калькулятор и пользовательские ярлыки ---
+        _act_calc_row, self.act_calc_hotkey_enabled = self._add_menu_action_row(
+            menu,
+            icon=self._icon(),
+            title="Калькулятор",
+            hotkey=self.main_hotkey,
+            checked=bool(self.calc_hotkey_enabled),
+            on_checked=self._set_calc_hotkey_enabled_from_menu,
+            on_trigger=self._do_toggle,
+        )
 
         if not minimal:
             if self._pro_soft_active():
@@ -3650,6 +3928,7 @@ class CalcTrayApp(QWidget):
             try:
                 tray_windows_menu = managed_windows.build_tray_windows_menu(self)
                 if tray_windows_menu is not None:
+                    self._apply_menu_theme_tree(tray_windows_menu)
                     menu.addMenu(tray_windows_menu)
                     menu.addSeparator()
             except Exception as e:
@@ -3658,21 +3937,6 @@ class CalcTrayApp(QWidget):
         if (not minimal) and (not self._pro_secure_active()) and self._paid_items_visible():
             menu.addMenu(self._locked_menu("Окна в трей", ["Текущее окно → в трей", "Восстановить все", "Настройки окон…"]))
             menu.addSeparator()
-
-        hotkey_widget = QWidget()
-        hotkey_widget.setStyleSheet(TRANSPARENT_BG)
-        hkh = QHBoxLayout(hotkey_widget)
-        hkh.setContentsMargins(10, 4, 10, 4)
-        hkh.setSpacing(4)
-        self.act_calc_hotkey_enabled = QCheckBox(f"Обработка хоткея калькулятора: {self.main_hotkey}")
-        self.act_calc_hotkey_enabled.setChecked(self.calc_hotkey_enabled)
-        self.act_calc_hotkey_enabled.setStyleSheet(MENU_CHECKBOX_QSS)
-        self.act_calc_hotkey_enabled.toggled.connect(lambda _checked: self._toggle_calc_hotkey_enabled())
-        hkh.addWidget(self.act_calc_hotkey_enabled)
-        hkh.addStretch(1)
-        wa_hotkey = QWidgetAction(self)
-        wa_hotkey.setDefaultWidget(hotkey_widget)
-        menu.addAction(wa_hotkey)
 
         if minimal:
             menu.addSeparator()
@@ -3688,19 +3952,20 @@ class CalcTrayApp(QWidget):
 
         # --- Ползунок прозрачности ---
         self.lbl_opacity = QLabel(f"Непрозрачность: {self.opacity_pct}%")
-        self.lbl_opacity.setStyleSheet(LABEL_NOTE + " padding-left:2px; min-width:128px;")
+        self.lbl_opacity.setStyleSheet(LABEL_NOTE + " padding-left:2px;")
         self.sld_opacity = QSlider(Qt.Horizontal)
         self.sld_opacity.setRange(0, 100)
         self.sld_opacity.setValue(self.opacity_pct)
-        self.sld_opacity.setFixedWidth(110)
+        self.sld_opacity.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.sld_opacity.setStyleSheet(SLIDER_QSS)
         self.sld_opacity.valueChanged.connect(self._on_opacity)
         w_opacity = QWidget()
         w_opacity.setStyleSheet(TRANSPARENT_BG)
-        hl = QHBoxLayout(w_opacity)
-        hl.setContentsMargins(12, 5, 12, 5)
-        hl.addWidget(self.lbl_opacity)
-        hl.addWidget(self.sld_opacity)
+        vl_opacity = QVBoxLayout(w_opacity)
+        vl_opacity.setContentsMargins(12, 3, 12, 4)
+        vl_opacity.setSpacing(1)
+        vl_opacity.addWidget(self.lbl_opacity)
+        vl_opacity.addWidget(self.sld_opacity)
         wa_opacity = QWidgetAction(self)
         wa_opacity.setDefaultWidget(w_opacity)
         menu.addAction(wa_opacity)
@@ -3727,6 +3992,7 @@ class CalcTrayApp(QWidget):
             try:
                 self.activity_menu = extra.build_tray_activity_menu(self)
                 if self.activity_menu is not None:
+                    self._apply_menu_theme_tree(self.activity_menu)
                     menu.addMenu(self.activity_menu)
             except Exception as e:
                 log(f"build_tray_activity_menu failed: {e}")
@@ -3736,92 +4002,90 @@ class CalcTrayApp(QWidget):
 
         menu.addSeparator()
 
+        quick_widget = QWidget()
+        quick_widget.setStyleSheet(TRANSPARENT_BG)
+        quick_widget.setFixedSize(MENU_QUICK_BLOCK_WIDTH, MENU_QUICK_BLOCK_HEIGHT)
+        quick_grid = QGridLayout(quick_widget)
+        quick_grid.setContentsMargins(*MENU_CONTROL_ROW_MARGINS)
+        quick_grid.setHorizontalSpacing(MENU_CONTROL_ROW_SPACING)
+        quick_grid.setVerticalSpacing(MENU_CONTROL_ROW_SPACING)
+        quick_grid.setColumnMinimumWidth(0, MENU_AFFIX_FIELD_WIDTH)
+        quick_grid.setColumnMinimumWidth(1, MENU_AFFIX_FIELD_WIDTH)
+        quick_grid.setColumnMinimumWidth(2, MENU_QUICK_MODE_WIDTH)
+        quick_grid.setColumnMinimumWidth(3, MENU_SQUARE_BUTTON_SIZE)
+        quick_toolbutton_qss = TOOLBUTTON_QSS + "\nQToolButton { padding: 0; min-width: 0px; min-height: 0px; }"
+
         if not self._pro_soft_active():
             if self._paid_items_visible():
                 menu.addMenu(self._locked_menu("Быстрая заметка", ["Поле ввода заметки", "Открыть окно", "Открыть файл заметок"]))
         else:
-            notes_widget = QWidget()
-            notes_widget.setStyleSheet(TRANSPARENT_BG)
-            nh = QHBoxLayout(notes_widget)
-            nh.setContentsMargins(10, 4, 10, 4)
-            nh.setSpacing(6)
-
             self.note_input = QLineEdit()
             self._refresh_notes_label()
             self.note_input.setStyleSheet(NOTE_INPUT_QSS)
-            self.note_input.setMinimumWidth(240)
+            self.note_input.setFixedWidth(MENU_QUICK_FIELD_WIDTH)
+            self.note_input.setFixedHeight(MENU_SQUARE_BUTTON_SIZE)
             self.note_input.returnPressed.connect(self._on_note_enter)
-            nh.addWidget(self.note_input, 1)
+            quick_grid.addWidget(self.note_input, 0, 0, 1, 2)
 
             btn_note_more = QToolButton()
             btn_note_more.setText("…")
             btn_note_more.setToolTip("Открыть окно быстрой заметки")
-            btn_note_more.setStyleSheet(TOOLBUTTON_QSS)
+            btn_note_more.setFixedSize(MENU_QUICK_MODE_WIDTH, MENU_SQUARE_BUTTON_SIZE)
+            btn_note_more.setStyleSheet(quick_toolbutton_qss)
             btn_note_more.clicked.connect(self._show_note_popup)
-            nh.addWidget(btn_note_more)
+            quick_grid.addWidget(btn_note_more, 0, 2)
 
             btn_note_notepad = QToolButton()
             btn_note_notepad.setText("⏏")
             btn_note_notepad.setToolTip("Открыть файл заметок в Блокноте")
-            btn_note_notepad.setFixedWidth(24)
-            btn_note_notepad.setStyleSheet(TOOLBUTTON_QSS)
+            btn_note_notepad.setFixedSize(MENU_SQUARE_BUTTON_SIZE, MENU_SQUARE_BUTTON_SIZE)
+            btn_note_notepad.setStyleSheet(quick_toolbutton_qss)
             btn_note_notepad.clicked.connect(self._open_notes_in_notepad)
-            nh.addWidget(btn_note_notepad)
-
-            wa_note = QWidgetAction(self)
-            wa_note.setDefaultWidget(notes_widget)
-            menu.addAction(wa_note)
+            quick_grid.addWidget(btn_note_notepad, 0, 3)
 
         # --- Быстрые настройки автокопирования результата ---
-        autocopy_widget = QWidget()
-        autocopy_widget.setStyleSheet(TRANSPARENT_BG)
-        ah = QHBoxLayout(autocopy_widget)
-        ah.setContentsMargins(10, 4, 10, 4)
-        ah.setSpacing(4)
-        self.chk_quick_auto_copy = QCheckBox(self._quick_auto_copy_label())
-        self.chk_quick_auto_copy.setChecked(_normalize_calc_clipboard_mode(
-            getattr(self, "calc_clipboard_mode", CALC_CLIPBOARD_RESULT),
-            allow_money_text=self._pro_soft_active(),
-        ) != CALC_CLIPBOARD_OFF)
-        self.chk_quick_auto_copy.setStyleSheet(MENU_CHECKBOX_QSS)
-        self.chk_quick_auto_copy.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        self.chk_quick_auto_copy.toggled.connect(self._set_auto_copy_on_enter_from_quick)
-        ah.addWidget(self.chk_quick_auto_copy)
+        self.btn_quick_auto_copy = QToolButton()
+        self.btn_quick_auto_copy.setText(self._quick_auto_copy_label())
+        self.btn_quick_auto_copy.setStyleSheet(quick_toolbutton_qss + "\nQToolButton::menu-indicator { image: none; width: 0px; }")
+        self.btn_quick_auto_copy.setCursor(Qt.PointingHandCursor)
+        self.btn_quick_auto_copy.setFixedSize(MENU_QUICK_MODE_WIDTH, MENU_SQUARE_BUTTON_SIZE)
+        self.btn_quick_auto_copy.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self.btn_quick_auto_copy.setPopupMode(QToolButton.InstantPopup)
+        self.btn_quick_auto_copy.setToolTip(self._quick_auto_copy_tooltip())
+        self.quick_auto_copy_menu = self._build_quick_auto_copy_mode_menu(self.btn_quick_auto_copy)
+        self.btn_quick_auto_copy.setMenu(self.quick_auto_copy_menu)
+        quick_grid.addWidget(self.btn_quick_auto_copy, 1, 2)
         if self._pro_soft_active():
-            lbl_sep = QLabel("|")
-            lbl_sep.setStyleSheet(LABEL_SEPARATOR)
-            ah.addWidget(lbl_sep)
-            lbl_prefix = QLabel("Префикс:")
-            lbl_prefix.setStyleSheet(LABEL_NOTE)
-            ah.addWidget(lbl_prefix)
             self.le_quick_auto_prefix = QLineEdit(self.auto_copy_prefix if self.auto_copy_prefix_enabled else "")
             self.le_quick_auto_prefix.setStyleSheet(NOTE_INPUT_QSS)
-            self.le_quick_auto_prefix.setFixedWidth(25)
+            self.le_quick_auto_prefix.setPlaceholderText("Префикс")
+            self.le_quick_auto_prefix.setFixedWidth(MENU_AFFIX_FIELD_WIDTH)
+            self.le_quick_auto_prefix.setFixedHeight(MENU_SQUARE_BUTTON_SIZE)
+            self.le_quick_auto_prefix.setToolTip("Префикс добавится перед текстом, который попадает в буфер обмена.")
             self.le_quick_auto_prefix.textChanged.connect(self._on_quick_auto_copy_affix_changed)
-            ah.addWidget(self.le_quick_auto_prefix)
-            lbl_suffix = QLabel("Суффикс:")
-            lbl_suffix.setStyleSheet(LABEL_NOTE)
-            ah.addWidget(lbl_suffix)
+            quick_grid.addWidget(self.le_quick_auto_prefix, 1, 0)
             self.le_quick_auto_suffix = QLineEdit(self.auto_copy_suffix if self.auto_copy_suffix_enabled else "")
             self.le_quick_auto_suffix.setStyleSheet(NOTE_INPUT_QSS)
-            self.le_quick_auto_suffix.setFixedWidth(25)
+            self.le_quick_auto_suffix.setPlaceholderText("Суффикс")
+            self.le_quick_auto_suffix.setFixedWidth(MENU_AFFIX_FIELD_WIDTH)
+            self.le_quick_auto_suffix.setFixedHeight(MENU_SQUARE_BUTTON_SIZE)
+            self.le_quick_auto_suffix.setToolTip("Суффикс добавится после текста, который попадает в буфер обмена.")
             self.le_quick_auto_suffix.textChanged.connect(self._on_quick_auto_copy_affix_changed)
-            ah.addWidget(self.le_quick_auto_suffix)
+            quick_grid.addWidget(self.le_quick_auto_suffix, 1, 1)
             btn_auto_reset = QPushButton("✕")
-            btn_auto_reset.setFixedSize(26, 26)
+            btn_auto_reset.setFixedSize(MENU_RESET_BUTTON_WIDTH, MENU_SQUARE_BUTTON_SIZE)
             btn_auto_reset.setStyleSheet(RESET_BUTTON_QSS)
             btn_auto_reset.setToolTip("Очистить префикс и суффикс. Автокопирование не выключается.")
             btn_auto_reset.clicked.connect(self._reset_quick_auto_copy_affixes)
-            ah.addWidget(btn_auto_reset)
+            quick_grid.addWidget(btn_auto_reset, 1, 3)
         elif self._paid_items_visible():
-            ah.addWidget(QLabel("|"))
             b_affix = QPushButton("🔒 Префикс/суффикс")
             b_affix.clicked.connect(lambda: self._show_pro_locked_popup("Префикс и суффикс"))
-            ah.addWidget(b_affix)
-        ah.addStretch(1)
-        wa_autocopy = QWidgetAction(self)
-        wa_autocopy.setDefaultWidget(autocopy_widget)
-        menu.addAction(wa_autocopy)
+            quick_grid.addWidget(b_affix, 1, 0, 1, 2)
+
+        wa_quick = QWidgetAction(self)
+        wa_quick.setDefaultWidget(quick_widget)
+        menu.addAction(wa_quick)
 
         menu.addSeparator()
 
@@ -3838,6 +4102,7 @@ class CalcTrayApp(QWidget):
         act_exit.triggered.connect(self._exit)
         menu.addAction(act_exit)
 
+        self._apply_menu_theme_tree(menu)
         return menu
 
     def _build_calculator_context_menu(self):
@@ -3850,8 +4115,9 @@ class CalcTrayApp(QWidget):
             "units_menu", "_unit_mode_buttons", "activity_menu",
             "pause_menu", "diary_pause_menu", "act_activity_enabled",
             "act_shot_enabled", "act_diary_enabled", "note_input",
-            "chk_quick_auto_copy", "le_quick_auto_prefix",
-            "le_quick_auto_suffix",
+            "btn_quick_auto_copy", "quick_auto_copy_menu",
+            "_quick_auto_copy_mode_actions",
+            "le_quick_auto_prefix", "le_quick_auto_suffix",
         )
         saved = {name: getattr(self, name, None) for name in names}
         existed = {name: hasattr(self, name) for name in names}
@@ -3923,15 +4189,19 @@ class CalcTrayApp(QWidget):
     def _add_launcher_actions(self, menu):
         added = False
         for item in list(getattr(self, "launcher_apps", []) or []):
-            if not item.get("enabled", True) or not item.get("show_in_tray", True):
+            if not item.get("show_in_tray", True):
                 continue
             title = str(item.get("title", "") or "").strip() or Path(str(item.get("path", "") or "")).stem or "Программа"
             hint = self._launcher_hint(item)
-            text = f"{title}\t{hint}" if hint else title
-            act = QAction(text, self)
-            act.setIcon(self._launcher_icon(item))
-            act.triggered.connect(lambda _, cfg=dict(item): self._launch_launcher_app(cfg))
-            menu.addAction(act)
+            self._add_menu_action_row(
+                menu,
+                icon=self._launcher_icon(item),
+                title=title,
+                hotkey=hint,
+                checked=bool(item.get("enabled", True)),
+                on_checked=lambda checked, cfg=item: self._set_launcher_enabled_from_menu(cfg, checked),
+                on_trigger=lambda cfg=item: self._launch_launcher_app(cfg) if cfg.get("enabled", True) else None,
+            )
             added = True
         if added:
             menu.addSeparator()
@@ -3962,6 +4232,16 @@ class CalcTrayApp(QWidget):
             log(f"Launcher activate failed: hwnd={hwnd}: {e}")
             return False
 
+    def _minimize_launcher_hwnd(self, hwnd) -> bool:
+        if not hwnd:
+            return False
+        try:
+            ShowWindow(hwnd, SW_MINIMIZE)
+            return True
+        except Exception as e:
+            log(f"Launcher minimize failed: hwnd={hwnd}: {e}")
+            return False
+
     def _launch_launcher_app(self, item: dict):
         if not self._pro_soft_active():
             self._show_pro_locked_popup("Ярлыки")
@@ -3972,9 +4252,21 @@ class CalcTrayApp(QWidget):
             return
         try:
             hwnd = self._find_launcher_hwnd(item)
-            if hwnd and self._activate_launcher_hwnd(hwnd):
-                log(f"Launcher activated existing window: {path}, hwnd={hwnd}")
-                return
+            if hwnd:
+                action = choose_launcher_action(
+                    int(hwnd),
+                    bool(IsWindowVisible(hwnd)),
+                    bool(IsIconic(hwnd)),
+                    bool(is_cloaked(hwnd)),
+                )
+                if action == ACTION_MINIMIZE:
+                    if self._minimize_launcher_hwnd(hwnd):
+                        log(f"Launcher minimized existing window: {path}, hwnd={hwnd}")
+                        return
+                elif action == ACTION_ACTIVATE:
+                    if self._activate_launcher_hwnd(hwnd):
+                        log(f"Launcher activated existing window: {path}, hwnd={hwnd}")
+                        return
 
             suffix = Path(path).suffix.lower()
             if suffix in (".lnk", ".bat", ".cmd", ".ps1"):
@@ -4023,6 +4315,23 @@ class CalcTrayApp(QWidget):
                 self._startup_mark("CALC_READY: delayed")
         except Exception as e:
             log(f"Open calculator on start failed: {e}")
+
+    def _show_calc_from_second_launch(self):
+        try:
+            if self._using_builtin_calc():
+                w = self._ensure_builtin_calc()
+                if w is not None and w.isVisible() and not w.isMinimized():
+                    w.raise_()
+                    w.activateWindow()
+                    return
+            else:
+                hwnd = self._find_target_hwnd()
+                if hwnd and bool(IsWindowVisible(hwnd)) and not bool(IsIconic(hwnd)) and not is_cloaked(hwnd):
+                    self._show(hwnd)
+                    return
+            self._do_toggle()
+        except Exception as e:
+            log(f"Second launch show calculator failed: {e}")
 
     def _keyboard_hook_needed(self) -> bool:
         if _normalize_calc_clipboard_mode(
@@ -4075,8 +4384,11 @@ class CalcTrayApp(QWidget):
             log(f"Keyboard listening pause started ({reason})")
             self._unregister_keyboard_hook(reason=reason)
             try:
+                self._unregister_native_hotkey(getattr(self, "_native_note_hotkey_id", None))
+                self._native_note_hotkey_id = None
                 if self._note_popup_hotkey_handle is not None:
-                    keyboard.remove_hotkey(self._note_popup_hotkey_handle)
+                    if globals().get("KEYBOARD_AVAILABLE", True) and keyboard is not None:
+                        keyboard.remove_hotkey(self._note_popup_hotkey_handle)
                     self._note_popup_hotkey_handle = None
             except Exception:
                 pass
@@ -4100,9 +4412,56 @@ class CalcTrayApp(QWidget):
             self._register_calc_hotkeys()
             if self._pro_soft_active():
                 self._register_launcher_hotkeys()
-            log(f"Hotkey recovery finished ({reason}); calc_handles={len(getattr(self, 'calc_hotkey_handles', []) or [])}, launcher_handles={len(getattr(self, 'launcher_hotkey_handles', []) or [])}")
+            log(
+                f"Hotkey recovery finished ({reason}); "
+                f"native_calc={len(getattr(self, '_native_calc_hotkey_ids', []) or [])}, "
+                f"calc_handles={len(getattr(self, 'calc_hotkey_handles', []) or [])}, "
+                f"native_launcher={len(getattr(self, '_native_launcher_hotkey_ids', []) or [])}, "
+                f"launcher_handles={len(getattr(self, 'launcher_hotkey_handles', []) or [])}"
+            )
         except Exception as e:
             log(f"Hotkey recovery failed ({reason}): {e}\n{traceback.format_exc()}")
+
+    def _keyboard_listener_alive(self) -> bool:
+        if not globals().get("KEYBOARD_AVAILABLE", True) or keyboard is None:
+            return False
+        try:
+            listener = getattr(keyboard, "_listener", None)
+            if listener is None or not bool(getattr(listener, "listening", False)):
+                return False
+            listening_thread = getattr(listener, "listening_thread", None)
+            processing_thread = getattr(listener, "processing_thread", None)
+            if listening_thread is not None and not listening_thread.is_alive():
+                return False
+            if processing_thread is not None and not processing_thread.is_alive():
+                return False
+            return True
+        except Exception as e:
+            log(f"Keyboard listener state check failed: {e}")
+            return False
+
+    def _keyboard_fallback_in_use(self) -> bool:
+        return bool(
+            getattr(self, "calc_hotkey_handles", None)
+            or getattr(self, "launcher_hotkey_handles", None)
+            or getattr(self, "_note_popup_hotkey_handle", None)
+            or getattr(self, "_keyboard_on_press_hook", None)
+        )
+
+    def _reset_keyboard_listener_if_dead(self, reason: str) -> bool:
+        if not self._keyboard_fallback_in_use():
+            return False
+        if self._keyboard_listener_alive():
+            return False
+        try:
+            listener = getattr(keyboard, "_listener", None) if keyboard is not None else None
+            if listener is not None:
+                listener.listening = False
+            log(f"Keyboard listener appears dead; forcing hotkey recovery ({reason})")
+        except Exception as e:
+            log(f"Keyboard listener reset failed ({reason}): {e}")
+        self._recover_hotkeys_after_resume(f"{reason}_listener_dead", force=True)
+        return True
 
     def _register_session_notifications(self) -> None:
         if not sys.platform.startswith("win"):
@@ -4136,6 +4495,54 @@ class CalcTrayApp(QWidget):
         finally:
             self._session_notifications_registered = False
 
+    def _register_native_hotkey(self, hotkey: str, callback, role: str) -> int | None:
+        if not sys.platform.startswith("win"):
+            return None
+        if not should_use_native_hotkey(hotkey):
+            return None
+        parsed = parse_native_hotkey(hotkey)
+        if parsed is None:
+            return None
+        modifiers, vk = parsed
+        try:
+            hwnd = int(self.winId())
+            if not hwnd:
+                return None
+            hotkey_id = int(getattr(self, "_native_hotkey_next_id", 0x4E43))
+            self._native_hotkey_next_id = hotkey_id + 1
+            if not user32.RegisterHotKey(wintypes.HWND(hwnd), hotkey_id, modifiers, vk):
+                log(f"Native hotkey register failed ({role}: {hotkey}); modifiers={modifiers}, vk={vk}")
+                return None
+            self._native_hotkey_callbacks[hotkey_id] = callback
+            self._native_hotkey_roles[hotkey_id] = role
+            log(f"Native hotkey registered: {role}: {hotkey}")
+            return hotkey_id
+        except Exception as e:
+            log(f"Native hotkey register exception ({role}: {hotkey}): {e}")
+            return None
+
+    def _unregister_native_hotkey(self, hotkey_id: int | None) -> None:
+        if hotkey_id is None:
+            return
+        try:
+            hwnd = int(self.winId())
+            if hwnd:
+                user32.UnregisterHotKey(wintypes.HWND(hwnd), int(hotkey_id))
+        except Exception as e:
+            log(f"Native hotkey unregister failed ({hotkey_id}): {e}")
+        finally:
+            try:
+                self._native_hotkey_callbacks.pop(int(hotkey_id), None)
+                self._native_hotkey_roles.pop(int(hotkey_id), None)
+                self._native_hotkey_last_fire.pop(int(hotkey_id), None)
+            except Exception:
+                pass
+
+    def _unregister_native_hotkeys(self, ids_attr: str) -> None:
+        for hotkey_id in list(getattr(self, ids_attr, []) or []):
+            self._unregister_native_hotkey(hotkey_id)
+        setattr(self, ids_attr, [])
+
     def _poll_keyboard_recovery_watchdog(self) -> None:
         if not bool(getattr(self, "running", False)) or not bool(getattr(self, "_startup_ready", False)):
             return
@@ -4163,13 +4570,14 @@ class CalcTrayApp(QWidget):
             log(f"Keyboard watchdog hook check failed: {e}")
 
         try:
-            if globals().get("KEYBOARD_AVAILABLE", True) and keyboard is not None:
-                if not getattr(self, "calc_hotkey_handles", None):
-                    self._register_calc_hotkeys()
-                if self._pro_soft_active() and self.note_popup_enabled and self._note_popup_hotkey_handle is None:
-                    self._register_note_popup_hotkey()
-                if self._pro_soft_active() and getattr(self, "launcher_apps", None) and not getattr(self, "launcher_hotkey_handles", None):
-                    self._register_launcher_hotkeys()
+            if self._reset_keyboard_listener_if_dead("watchdog"):
+                return
+            if not getattr(self, "_native_calc_hotkey_ids", None) and not getattr(self, "calc_hotkey_handles", None):
+                self._register_calc_hotkeys()
+            if self._pro_soft_active() and self.note_popup_enabled and self._native_note_hotkey_id is None and self._note_popup_hotkey_handle is None:
+                self._register_note_popup_hotkey()
+            if self._pro_soft_active() and getattr(self, "launcher_apps", None) and not getattr(self, "_native_launcher_hotkey_ids", None) and not getattr(self, "launcher_hotkey_handles", None):
+                self._register_launcher_hotkeys()
         except Exception as e:
             log(f"Keyboard watchdog hotkey check failed: {e}")
 
@@ -4188,7 +4596,25 @@ class CalcTrayApp(QWidget):
             WTS_REMOTE_DISCONNECT = 0x4
             WTS_SESSION_LOCK = 0x7
             WTS_SESSION_UNLOCK = 0x8
-            if msg.message == WM_POWERBROADCAST:
+            if WM_CALCNUMLOCK_SHOW_CALC and msg.message == WM_CALCNUMLOCK_SHOW_CALC:
+                log("Second launch wake request received")
+                QTimer.singleShot(0, self._show_calc_from_second_launch)
+                return True, 0
+            if msg.message == WM_HOTKEY:
+                hotkey_id = int(msg.wParam)
+                callback = getattr(self, "_native_hotkey_callbacks", {}).get(hotkey_id)
+                role = getattr(self, "_native_hotkey_roles", {}).get(hotkey_id, str(hotkey_id))
+                now = time.time()
+                if callback is not None and role == "calc toggle":
+                    last_fire = float(getattr(self, "_native_hotkey_last_fire", {}).get(hotkey_id, 0.0))
+                    if now - last_fire < 0.25:
+                        return True, 0
+                    self._native_hotkey_last_fire[hotkey_id] = now
+                if callback is not None:
+                    log(f"Native hotkey fired: {role}")
+                    callback()
+                    return True, 0
+            elif msg.message == WM_POWERBROADCAST:
                 code = int(msg.wParam)
                 if code == PBT_APMSUSPEND:
                     log("Power event: suspend; pausing keyboard listening")
@@ -4197,24 +4623,6 @@ class CalcTrayApp(QWidget):
                     log(f"Power event: resume code={code}; scheduling hotkey recovery")
                     QTimer.singleShot(800, lambda: self._recover_hotkeys_after_resume("power_resume_800ms", force=True))
                     QTimer.singleShot(2500, lambda: self._recover_hotkeys_after_resume("power_resume_2500ms"))
-            elif msg.message == WM_HOTKEY:
-                try:
-                    if int(msg.wParam) == HOTKEY_ID_CALC_TOGGLE:
-                        now = time.time()
-                        if now - float(getattr(self, "_native_hotkey_last_fire", 0.0)) < 0.25:
-                            return True, 0
-                        self._native_hotkey_last_fire = now
-                        if not self.running:
-                            return True, 0
-                        if not self.calc_hotkey_enabled:
-                            return True, 0
-                        if not getattr(self, "_startup_ready", False):
-                            self._pending_startup_toggle = True
-                            return True, 0
-                        self._sig_toggle.emit()
-                        return True, 0
-                except Exception:
-                    return True, 0
             elif msg.message == WM_WTSSESSION_CHANGE:
                 code = int(msg.wParam)
                 if code in (WTS_SESSION_LOCK, WTS_CONSOLE_DISCONNECT, WTS_REMOTE_DISCONNECT):
@@ -4232,44 +4640,26 @@ class CalcTrayApp(QWidget):
         return super().nativeEvent(eventType, message)
 
     def _unregister_calc_hotkeys(self):
-        if getattr(self, "_native_calc_hotkey_id", None) is not None:
-            try:
-                hwnd = int(self.winId())
-                if hwnd:
-                    user32.UnregisterHotKey(wintypes.HWND(hwnd), int(self._native_calc_hotkey_id))
-            except Exception as e:
-                log(f"Unregister native calc hotkey failed: {e}")
-            self._native_calc_hotkey_id = None
-        if not globals().get("KEYBOARD_AVAILABLE", True) or keyboard is None:
-            self.calc_hotkey_handles = []
-            return
+        self._unregister_native_hotkeys("_native_calc_hotkey_ids")
         for h in list(getattr(self, "calc_hotkey_handles", []) or []):
             try:
-                keyboard.remove_hotkey(h)
+                if globals().get("KEYBOARD_AVAILABLE", True) and keyboard is not None:
+                    keyboard.remove_hotkey(h)
             except Exception:
                 pass
         self.calc_hotkey_handles = []
 
     def _register_calc_hotkeys(self, primary_only: bool = False):
         self._unregister_calc_hotkeys()
-        main_hk = (getattr(self, "main_hotkey", "num lock") or "num lock").strip().lower()
-        pause_hk = (getattr(self, "calc_pause_hotkey", "shift+num lock") or "shift+num lock").strip().lower()
-        keyboard_available = globals().get("KEYBOARD_AVAILABLE", True) and keyboard is not None
-        used = set()
+        main_hk = normalize_hotkey(getattr(self, "main_hotkey", "num lock")) or "num lock"
+        pause_hk = normalize_hotkey(getattr(self, "calc_pause_hotkey", "shift+num lock")) or "shift+num lock"
+        used = []
         if main_hk:
-            keyboard_available = globals().get("KEYBOARD_AVAILABLE", True) and keyboard is not None
-            if main_hk == "num lock":
-                try:
-                    hwnd = int(self.winId())
-                    if hwnd and user32.RegisterHotKey(wintypes.HWND(hwnd), HOTKEY_ID_CALC_TOGGLE, MOD_NOREPEAT, VK_NUMLOCK):
-                        self._native_calc_hotkey_id = HOTKEY_ID_CALC_TOGGLE
-                        used.add(main_hk)
-                        log(f"Calc toggle native hotkey registered: {main_hk}")
-                    else:
-                        log(f"Calc toggle native hotkey register failed ({main_hk!r})")
-                except Exception as e:
-                    log(f"Calc toggle native hotkey register exception ({main_hk!r}): {e}")
-            if self._native_calc_hotkey_id is None and keyboard_available:
+            native_id = self._register_native_hotkey(main_hk, self._handle_calc_toggle_hotkey, "calc toggle")
+            if native_id is not None:
+                self._native_calc_hotkey_ids.append(native_id)
+                used.append(("calc toggle", main_hk))
+            elif globals().get("KEYBOARD_AVAILABLE", True) and keyboard is not None:
                 try:
                     h = keyboard.add_hotkey(
                         main_hk,
@@ -4278,19 +4668,24 @@ class CalcTrayApp(QWidget):
                         trigger_on_release=False,
                     )
                     self.calc_hotkey_handles.append(h)
-                    used.add(main_hk)
-                    log(f"Calc toggle hotkey registered: {main_hk}")
+                    used.append(("calc toggle", main_hk))
+                    log(f"Calc toggle hotkey registered via keyboard: {main_hk}")
                 except Exception as e:
                     log(f"Calc toggle hotkey register failed ({main_hk!r}): {e}")
-            elif self._native_calc_hotkey_id is None:
-                try:
-                    log(f"Calc toggle hotkey skipped: keyboard unavailable: {globals().get('KEYBOARD_IMPORT_ERROR', '')}")
-                except Exception:
-                    pass
+            else:
+                log(f"Calc toggle hotkey skipped: keyboard unavailable: {globals().get('KEYBOARD_IMPORT_ERROR', '')}")
         if primary_only:
             return
-        if pause_hk and pause_hk not in used:
-            if keyboard_available:
+        conflict = has_hotkey_conflict(pause_hk, used)
+        if conflict and _is_allowed_default_calc_hotkey_overlap("calc pause", pause_hk, conflict[0], conflict[1]):
+            conflict = None
+        if conflict:
+            log(f"Calc pause hotkey skipped because of conflict: {pause_hk} conflicts with {conflict[0]} ({conflict[1]})")
+        elif pause_hk:
+            native_id = self._register_native_hotkey(pause_hk, self._handle_calc_pause_hotkey, "calc pause")
+            if native_id is not None:
+                self._native_calc_hotkey_ids.append(native_id)
+            elif globals().get("KEYBOARD_AVAILABLE", True) and keyboard is not None:
                 try:
                     h = keyboard.add_hotkey(
                         pause_hk,
@@ -4299,14 +4694,11 @@ class CalcTrayApp(QWidget):
                         trigger_on_release=False,
                     )
                     self.calc_hotkey_handles.append(h)
-                    log(f"Calc pause hotkey registered: {pause_hk}")
+                    log(f"Calc pause hotkey registered via keyboard: {pause_hk}")
                 except Exception as e:
                     log(f"Calc pause hotkey register failed ({pause_hk!r}): {e}")
             else:
-                try:
-                    log(f"Calc pause hotkey skipped: keyboard unavailable: {globals().get('KEYBOARD_IMPORT_ERROR', '')}")
-                except Exception:
-                    pass
+                log(f"Calc pause hotkey skipped: keyboard unavailable: {globals().get('KEYBOARD_IMPORT_ERROR', '')}")
 
     def _hotkey_delay_blocked(self) -> bool:
         now = time.time()
@@ -4319,10 +4711,6 @@ class CalcTrayApp(QWidget):
     def _handle_calc_toggle_hotkey(self):
         if not self.running:
             return
-        now = time.time()
-        if now - float(getattr(self, "_native_hotkey_last_fire", 0.0)) < 0.25:
-            return
-        self._native_hotkey_last_fire = now
         # При дефолтной паре num lock / shift+num lock не даём Shift+NumLock
         # одновременно вызвать и паузу, и открытие калькулятора.
         try:
@@ -4358,9 +4746,11 @@ class CalcTrayApp(QWidget):
         log(f"Calc hotkey enabled by pause hotkey: {self.calc_hotkey_enabled}")
 
     def _unregister_launcher_hotkeys(self):
+        self._unregister_native_hotkeys("_native_launcher_hotkey_ids")
         for h in list(getattr(self, "launcher_hotkey_handles", []) or []):
             try:
-                keyboard.remove_hotkey(h)
+                if globals().get("KEYBOARD_AVAILABLE", True) and keyboard is not None:
+                    keyboard.remove_hotkey(h)
             except Exception:
                 pass
         self.launcher_hotkey_handles = []
@@ -4369,30 +4759,58 @@ class CalcTrayApp(QWidget):
         self._unregister_launcher_hotkeys()
         if not self._pro_soft_active():
             return
-        used = set()
-        note_hk = (self.note_popup_hotkey or "").strip().lower()
-        main_hk = (self.main_hotkey or "num lock").strip().lower()
+        used = [
+            ("calc toggle", normalize_hotkey(self.main_hotkey or "num lock")),
+            ("calc pause", normalize_hotkey(getattr(self, "calc_pause_hotkey", "shift+num lock"))),
+        ]
+        note_hk = normalize_hotkey(self.note_popup_hotkey or "")
+        if getattr(self, "note_popup_enabled", False) and note_hk:
+            used.append(("note popup", note_hk))
         for item in list(getattr(self, "launcher_apps", []) or []):
             if not item.get("enabled", True):
                 continue
-            hk = str(item.get("hotkey", "") or "").strip().lower()
+            hk = normalize_hotkey(item.get("hotkey", ""))
             if not hk:
                 continue
-            if hk in used or hk == note_hk or hk == main_hk:
-                log(f"Launcher hotkey skipped because of conflict: {hk}")
+            conflict = has_hotkey_conflict(hk, used)
+            if conflict:
+                log(f"Launcher hotkey skipped because of conflict: {hk} conflicts with {conflict[0]} ({conflict[1]})")
                 continue
-            try:
-                handle = keyboard.add_hotkey(
-                    hk,
-                    lambda cfg=dict(item): self._launch_launcher_app(cfg),
-                    suppress=False,
-                    trigger_on_release=False,
-                )
-                self.launcher_hotkey_handles.append(handle)
-                used.add(hk)
-                log(f"Launcher hotkey registered: {hk}")
-            except Exception as e:
-                log(f"Launcher hotkey register failed ({hk!r}): {e}")
+            callback = lambda cfg=dict(item): self._launch_launcher_app(cfg)
+            role = f"launcher: {item.get('name') or item.get('path') or hk}"
+            native_id = self._register_native_hotkey(hk, callback, role)
+            if native_id is not None:
+                self._native_launcher_hotkey_ids.append(native_id)
+                used.append((role, hk))
+            elif globals().get("KEYBOARD_AVAILABLE", True) and keyboard is not None:
+                try:
+                    handle = keyboard.add_hotkey(
+                        hk,
+                        callback,
+                        suppress=False,
+                        trigger_on_release=False,
+                    )
+                    self.launcher_hotkey_handles.append(handle)
+                    used.append((role, hk))
+                    log(f"Launcher hotkey registered via keyboard: {hk}")
+                except Exception as e:
+                    log(f"Launcher hotkey register failed ({hk!r}): {e}")
+            else:
+                log(f"Launcher hotkey skipped: keyboard unavailable: {globals().get('KEYBOARD_IMPORT_ERROR', '')}")
+
+    def _set_calc_hotkey_enabled_from_menu(self, checked: bool):
+        self.calc_hotkey_enabled = bool(checked)
+        self._save_settings()
+        log(f"Calc hotkey enabled: {self.calc_hotkey_enabled}")
+
+    def _set_launcher_enabled_from_menu(self, item: dict, checked: bool):
+        try:
+            item["enabled"] = bool(checked)
+            self._save_pro_soft_settings()
+            self._register_launcher_hotkeys()
+            log(f"Launcher enabled from menu: {item.get('title') or item.get('path')}: {bool(checked)}")
+        except Exception as e:
+            log(f"Launcher enabled toggle failed: {e}")
 
     def _toggle_auto_copy_on_enter(self):
         if _normalize_calc_clipboard_mode(
@@ -4405,6 +4823,11 @@ class CalcTrayApp(QWidget):
         self.auto_copy_on_enter = self.calc_clipboard_mode != CALC_CLIPBOARD_OFF
         self.auto_copy_mode = self.calc_clipboard_mode
         self._sync_auto_copy_quick_widgets()
+        try:
+            if getattr(self, "_builtin_calc_window", None) is not None:
+                self._builtin_calc_window.set_clipboard_mode(self.calc_clipboard_mode, notify=False)
+        except Exception as e:
+            log(f"Sync builtin calc copy mode failed: {e}")
         self._save_settings()
         self._register_keyboard_hook(reason="auto_copy_toggle")
         log(f"Auto copy mode: {self.calc_clipboard_mode}; enabled={self.auto_copy_on_enter}")
@@ -4469,24 +4892,75 @@ class CalcTrayApp(QWidget):
             getattr(self, "calc_clipboard_mode", CALC_CLIPBOARD_RESULT),
             allow_money_text=self._pro_soft_active(),
         )
-        if mode == CALC_CLIPBOARD_TEXT:
-            return "Результат в буфер: Tx"
-        if mode == CALC_CLIPBOARD_MONEY_TEXT:
-            return "Результат в буфер: ₽т"
-        return "Результат в буфер"
+        return format_auto_copy_caption(mode)
+
+    def _quick_auto_copy_tooltip(self) -> str:
+        mode = _normalize_calc_clipboard_mode(
+            getattr(self, "calc_clipboard_mode", CALC_CLIPBOARD_RESULT),
+            allow_money_text=self._pro_soft_active(),
+        )
+        return (
+            auto_copy_mode_tooltip(mode)
+            + "\nКлик по кнопке — выбрать режим автокопирования."
+        )
+
+    def _quick_auto_copy_modes(self) -> list[str]:
+        modes = [CALC_CLIPBOARD_OFF, CALC_CLIPBOARD_RESULT, CALC_CLIPBOARD_TEXT]
+        if self._pro_soft_active():
+            modes.append(CALC_CLIPBOARD_MONEY_TEXT)
+        return modes
+
+    def _build_quick_auto_copy_mode_menu(self, parent=None) -> QMenu:
+        mode_menu = QMenu(parent or self)
+        mode_menu.setStyleSheet(MENU_QSS)
+        actions = []
+        for mode in self._quick_auto_copy_modes():
+            act = QAction(format_auto_copy_menu_label(mode), mode_menu)
+            act.setData(mode)
+            act.setToolTip(auto_copy_mode_tooltip(mode))
+            act.triggered.connect(lambda _checked=False, m=mode: self._set_auto_copy_mode_from_quick(m))
+            mode_menu.addAction(act)
+            actions.append(act)
+        self._quick_auto_copy_mode_actions = actions
+        mode_menu.aboutToShow.connect(self._refresh_quick_auto_copy_mode_menu)
+        self._refresh_quick_auto_copy_mode_menu()
+        return mode_menu
+
+    def _refresh_quick_auto_copy_mode_menu(self):
+        if hasattr(self, "btn_quick_auto_copy"):
+            self.btn_quick_auto_copy.setText(self._quick_auto_copy_label())
+            self.btn_quick_auto_copy.setToolTip(self._quick_auto_copy_tooltip())
+        actions = getattr(self, "_quick_auto_copy_mode_actions", None)
+        if not actions:
+            return
+        for act in actions:
+            try:
+                act.setEnabled(True)
+            except Exception:
+                pass
+
+    def _set_auto_copy_mode_from_quick(self, mode: str):
+        self.calc_clipboard_mode = _normalize_calc_clipboard_mode(
+            mode,
+            allow_money_text=self._pro_soft_active(),
+        )
+        self.auto_copy_on_enter = self.calc_clipboard_mode != CALC_CLIPBOARD_OFF
+        self.auto_copy_mode = self.calc_clipboard_mode
+        self._sync_auto_copy_quick_widgets()
+        try:
+            if getattr(self, "_builtin_calc_window", None) is not None:
+                self._builtin_calc_window.set_clipboard_mode(self.calc_clipboard_mode, notify=False)
+        except Exception as e:
+            log(f"Sync builtin calc copy mode failed: {e}")
+        self._save_settings()
+        self._register_keyboard_hook(reason="auto_copy_quick_mode")
+        log(f"Auto copy mode: {self.calc_clipboard_mode}; enabled={self.auto_copy_on_enter}")
 
     def _sync_auto_copy_quick_widgets(self):
-        if hasattr(self, "chk_quick_auto_copy"):
-            try:
-                self.chk_quick_auto_copy.blockSignals(True)
-                mode = _normalize_calc_clipboard_mode(
-                    getattr(self, "calc_clipboard_mode", CALC_CLIPBOARD_RESULT),
-                    allow_money_text=self._pro_soft_active(),
-                )
-                self.chk_quick_auto_copy.setChecked(mode != CALC_CLIPBOARD_OFF)
-                self.chk_quick_auto_copy.setText(self._quick_auto_copy_label())
-            finally:
-                self.chk_quick_auto_copy.blockSignals(False)
+        if hasattr(self, "btn_quick_auto_copy"):
+            self.btn_quick_auto_copy.setText(self._quick_auto_copy_label())
+            self.btn_quick_auto_copy.setToolTip(self._quick_auto_copy_tooltip())
+            self._refresh_quick_auto_copy_mode_menu()
         if hasattr(self, "le_quick_auto_prefix"):
             try:
                 self.le_quick_auto_prefix.blockSignals(True)
@@ -4868,24 +5342,45 @@ class CalcTrayApp(QWidget):
         if not self._pro_soft_active():
             return
         try:
+            self._unregister_native_hotkey(getattr(self, "_native_note_hotkey_id", None))
+            self._native_note_hotkey_id = None
             if self._note_popup_hotkey_handle is not None:
                 try:
-                    keyboard.remove_hotkey(self._note_popup_hotkey_handle)
+                    if globals().get("KEYBOARD_AVAILABLE", True) and keyboard is not None:
+                        keyboard.remove_hotkey(self._note_popup_hotkey_handle)
                 except Exception:
                     pass
                 self._note_popup_hotkey_handle = None
             if not self.note_popup_enabled:
                 return
-            hk = (self.note_popup_hotkey or "").strip()
+            hk = normalize_hotkey(self.note_popup_hotkey or "")
             if not hk:
                 return
-            self._note_popup_hotkey_handle = keyboard.add_hotkey(
-                hk,
-                lambda: self._sig_note_popup_show.emit(),
-                suppress=False,
-                trigger_on_release=False,
-            )
-            log(f"Note popup hotkey registered: {hk}")
+            used = [
+                ("calc toggle", normalize_hotkey(self.main_hotkey or "num lock")),
+                ("calc pause", normalize_hotkey(getattr(self, "calc_pause_hotkey", "shift+num lock"))),
+            ]
+            for item in list(getattr(self, "launcher_apps", []) or []):
+                if item.get("enabled", True):
+                    used.append((f"launcher: {item.get('name') or item.get('path') or ''}", normalize_hotkey(item.get("hotkey", ""))))
+            conflict = has_hotkey_conflict(hk, used)
+            if conflict:
+                log(f"Note popup hotkey skipped because of conflict: {hk} conflicts with {conflict[0]} ({conflict[1]})")
+                return
+            callback = lambda: self._sig_note_popup_show.emit()
+            native_id = self._register_native_hotkey(hk, callback, "note popup")
+            if native_id is not None:
+                self._native_note_hotkey_id = native_id
+            elif globals().get("KEYBOARD_AVAILABLE", True) and keyboard is not None:
+                self._note_popup_hotkey_handle = keyboard.add_hotkey(
+                    hk,
+                    callback,
+                    suppress=False,
+                    trigger_on_release=False,
+                )
+                log(f"Note popup hotkey registered via keyboard: {hk}")
+            else:
+                log(f"Note popup hotkey skipped: keyboard unavailable: {globals().get('KEYBOARD_IMPORT_ERROR', '')}")
         except Exception as e:
             log(f"Note popup hotkey register failed ({self.note_popup_hotkey!r}): {e}")
             self._note_popup_hotkey_handle = None
@@ -4942,8 +5437,11 @@ class CalcTrayApp(QWidget):
         except Exception:
             pass
         try:
+            self._unregister_native_hotkey(getattr(self, "_native_note_hotkey_id", None))
+            self._native_note_hotkey_id = None
             if self._note_popup_hotkey_handle is not None:
-                keyboard.remove_hotkey(self._note_popup_hotkey_handle)
+                if globals().get("KEYBOARD_AVAILABLE", True) and keyboard is not None:
+                    keyboard.remove_hotkey(self._note_popup_hotkey_handle)
                 self._note_popup_hotkey_handle = None
         except Exception:
             pass
@@ -5033,6 +5531,7 @@ class CalcTrayApp(QWidget):
                 money_text_formatter=self._format_money_text_for_copy if self._pro_soft_active() else None,
                 allow_money_text=self._pro_soft_active(),
                 copy_text_postprocessor=self._apply_auto_copy_affixes,
+                fixed_minimum_size=bool(getattr(self, "calc_fixed_min_size", False)),
             )
             try:
                 if hasattr(self._builtin_calc_window, "clipboardModeChanged"):
@@ -5046,6 +5545,8 @@ class CalcTrayApp(QWidget):
                 self._startup_mark("CALC_SHELL_ICON_DONE")
             except Exception:
                 pass
+            self._apply_calc_topmost()
+            self._apply_builtin_calc_size_lock()
         else:
             self._startup_mark("CALC_WINDOW_REUSE")
             try:
@@ -5065,6 +5566,7 @@ class CalcTrayApp(QWidget):
                     )
             except Exception as e:
                 log(f"Builtin calculator option sync failed: {e}")
+            self._apply_builtin_calc_size_lock()
         self._startup_mark("CALC_ENSURE_DONE")
         return self._builtin_calc_window
 
@@ -5080,6 +5582,32 @@ class CalcTrayApp(QWidget):
                 log("Builtin calculator prewarmed")
         except Exception as e:
             log(f"Builtin calculator prewarm failed: {e}")
+
+    def _apply_calc_topmost(self) -> None:
+        """Применяет режим «поверх всех окон» к текущему калькулятору."""
+        enabled = bool(getattr(self, "calc_always_on_top", False))
+        try:
+            if self._using_builtin_calc() and self._builtin_calc_window is not None:
+                w = self._builtin_calc_window
+                visible = w.isVisible()
+                w.setWindowFlag(Qt.WindowStaysOnTopHint, enabled)
+                if visible:
+                    w.show()
+                    w.raise_()
+            else:
+                hwnd = self._find_target_hwnd()
+                if hwnd:
+                    SetWindowPos(hwnd, -1 if enabled else HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE)
+        except Exception as e:
+            log(f"Apply calculator topmost failed: {e}")
+
+    def _apply_builtin_calc_size_lock(self) -> None:
+        try:
+            w = getattr(self, "_builtin_calc_window", None)
+            if w is not None and hasattr(w, "set_fixed_minimum_size"):
+                w.set_fixed_minimum_size(bool(getattr(self, "calc_fixed_min_size", False)))
+        except Exception as e:
+            log(f"Apply builtin calculator size lock failed: {e}")
 
     def _toggle_builtin_calc(self):
         self._startup_mark("CALC_TOGGLE_BUILTIN_BEGIN")
@@ -5109,12 +5637,14 @@ class CalcTrayApp(QWidget):
                     else:
                         w.move(geo.center().x() - w.width() // 2, geo.center().y() - w.height() // 2)
                 self._startup_mark("CALC_SCREEN_GEOMETRY_DONE")
+            self._apply_builtin_calc_size_lock()
             # ВАЖНО: opacity до первого show() на Windows может переводить окно
             # в layered-mode и резко замедлять первый показ. Сначала показываем
             # рабочий калькулятор, затем применяем прозрачность отложенно.
             opacity_value = max(0.1, min(1.0, float(self.opacity_pct) / 100.0))
             self._startup_mark("CALC_OPACITY_DEFERRED_SCHEDULED")
 
+            self._apply_calc_topmost()
             self._startup_mark("CALC_SHOW_BEGIN")
             w.show()
             self._startup_mark("CALC_SHOW_DONE")
@@ -5255,7 +5785,7 @@ class CalcTrayApp(QWidget):
         ShowWindow(hwnd, SW_RESTORE)
         ShowWindow(hwnd, SW_SHOW)
         x, y = self._target_pos(hwnd)
-        SetWindowPos(hwnd, HWND_NOTOPMOST, x, y, 0, 0, SWP_NOSIZE | SWP_SHOWWINDOW)
+        SetWindowPos(hwnd, -1 if bool(getattr(self, "calc_always_on_top", False)) else HWND_NOTOPMOST, x, y, 0, 0, SWP_NOSIZE | SWP_SHOWWINDOW)
         SetForegroundWindow(hwnd)
         apply_opacity(hwnd, self.opacity_pct)
         r = get_rect(hwnd)
@@ -5373,6 +5903,40 @@ def _ensure_single_instance() -> bool:
         return True  # не блокируем запуск
 
 
+def _second_launch_should_show_calc() -> bool:
+    try:
+        if not SETTINGS_FILE.exists():
+            return False
+        data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+        return bool(data.get("calc_second_launch_shows_calc", False))
+    except Exception as e:
+        try:
+            log(f"second-launch setting read failed: {e}")
+        except Exception:
+            pass
+        return False
+
+
+def _request_existing_instance_show_calc() -> bool:
+    if not (sys.platform.startswith("win") and WM_CALCNUMLOCK_SHOW_CALC):
+        return False
+    try:
+        ok = ctypes.windll.user32.PostMessageW(
+            wintypes.HWND(HWND_BROADCAST),
+            wintypes.UINT(WM_CALCNUMLOCK_SHOW_CALC),
+            wintypes.WPARAM(0),
+            wintypes.LPARAM(0),
+        )
+        log(f"second-launch wake request sent: ok={bool(ok)}")
+        return bool(ok)
+    except Exception as e:
+        try:
+            log(f"second-launch wake request failed: {e}")
+        except Exception:
+            pass
+        return False
+
+
 def _install_crash_logging() -> None:
     """Перехват необработанных Python-исключений и C-крашей.
 
@@ -5448,6 +6012,9 @@ def main():
         pass
 
     if not _ensure_single_instance():
+        if _second_launch_should_show_calc():
+            _request_existing_instance_show_calc()
+            sys.exit(0)
         try:
             QMessageBox.information(
                 None, APP_NAME,

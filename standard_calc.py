@@ -21,6 +21,7 @@ from PyQt5.QtWidgets import (
 
 from standard_calc_engine import ACTION_TO_OP, Op, StandardEngine, StandardState, Formatter, FormatOptions
 from styles import active_palette, build_qss, is_windows_dark_mode
+from calc_window_geometry import CALC_MIN_HEIGHT, CALC_MIN_WIDTH, calc_size_limits
 
 try:
     from functions import load_embedded_icon, startup_profile
@@ -589,6 +590,7 @@ class StandardPercentCalculator(QMainWindow):
         money_text_formatter=None,
         allow_money_text: bool = False,
         copy_text_postprocessor=None,
+        fixed_minimum_size: bool = False,
     ) -> None:
         _calc_profile("CALC_WINDOW_INIT_BEGIN")
         super().__init__()
@@ -601,8 +603,9 @@ class StandardPercentCalculator(QMainWindow):
                 _calc_profile("CALC_ICON_DONE")
         except Exception:
             pass
-        self.resize(380, 600)
-        self.setMinimumSize(320, 500)
+        self._fixed_minimum_size = bool(fixed_minimum_size)
+        self.resize(CALC_MIN_WIDTH, CALC_MIN_HEIGHT)
+        self._apply_size_limits()
         _calc_profile("CALC_GEOMETRY_DONE")
         self.engine = StandardEngine(Formatter(FormatOptions(group_digits=bool(group_digits))))
         _calc_profile("CALC_ENGINE_CREATE_DONE")
@@ -638,6 +641,17 @@ class StandardPercentCalculator(QMainWindow):
                 pass
         _calc_profile("CALC_SHORTCUTS_CREATE_DONE")
         _calc_profile("CALC_WINDOW_INIT_DONE")
+
+    def _apply_size_limits(self) -> None:
+        min_w, min_h, max_w, max_h = calc_size_limits(self._fixed_minimum_size)
+        self.setMinimumSize(min_w, min_h)
+        self.setMaximumSize(max_w, max_h)
+        if self._fixed_minimum_size:
+            self.resize(min_w, min_h)
+
+    def set_fixed_minimum_size(self, enabled: bool) -> None:
+        self._fixed_minimum_size = bool(enabled)
+        self._apply_size_limits()
 
     def _build_ui(self) -> None:
         root = QWidget()

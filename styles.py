@@ -446,14 +446,14 @@ QMenu {{
     color: {p.text_primary};
     border: 1px solid {p.border};
     border-radius: {RADIUS_CARD}px;
-    padding: 4px;
+    padding: 2px;
     font-family: {FONT_TEXT};
     font-size: 13px;
 }}
 QMenu::item {{
     background: transparent;
     color: {p.text_primary};
-    padding: 6px 16px;
+    padding: 5px 10px;
     min-height: 18px;
     border-radius: {RADIUS_BUTTON}px;
 }}
@@ -466,15 +466,15 @@ QMenu::item:disabled {{
 QMenu::separator {{
     height: 1px;
     background-color: {p.separator};
-    margin: 4px 8px;
+    margin: 3px 6px;
 }}
 QMenu::indicator {{
-    width: 16px;
-    height: 16px;
+    width: 14px;
+    height: 14px;
 }}
 QMenu::right-arrow {{
-    width: 9px;
-    height: 9px;
+    width: 7px;
+    height: 7px;
 }}
 """
 

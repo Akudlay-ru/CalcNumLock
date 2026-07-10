@@ -35,13 +35,21 @@ import zipfile
 from datetime import datetime
 from pathlib import Path
 
-APP_BASENAME = "NumLockCalc_2026_9.0.1_FREE_CORE_RELEASE"
+APP_BASENAME = "NumLockCalc_2026_9.0.6_FREE_CORE_RELEASE"
 ENTRY_FILE = "calc_numlock_tray.pyw"
 ICON_FILE = "calculator_icon.ico"
 
 CORE_PY_FILES = [
     "calc_numlock_tray.pyw",
     "functions.py",
+    "hotkey_registry.py",
+    "launcher_window_state.py",
+    "menu_action_row.py",
+    "note_storage.py",
+    "native_hotkeys.py",
+    "calc_window_geometry.py",
+    "note_send_modes.py",
+    "note_recipients.py",
     "styles.py",
     "standard_calc.py",
     "standard_calc_engine.py",
@@ -74,7 +82,14 @@ HIDDEN_IMPORTS = [
     "PyQt5.QtGui",
     "PyQt5.QtWidgets",
     "PyQt5.QtWinExtras",
+    "psutil",
     "keyboard",
+    "hotkey_registry",
+    "launcher_window_state",
+    "menu_action_row",
+    "note_storage",
+    "native_hotkeys",
+    "calc_window_geometry",
 ]
 
 

@@ -1,9 +1,10 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""Базовый функционал CalcNumLock 9.0.1.
+"""Базовый функционал CalcNumLock 9.0.6.
 
 Содержит пути, logging, WinAPI helpers, работу с окнами калькулятора,
-буфером, меню и базовые UI-классы Free Core.
+буфером, меню и базовые UI-классы. Платные слои вынесены в pro_soft.py
+и pro_secure.py.
 """
 
 import ctypes
@@ -29,7 +30,7 @@ from PyQt5.QtWidgets import (
 # Идентификация приложения
 # ---------------------------------------------------------------------------
 APP_NAME    = "CalcNumLock"
-APP_VERSION = "9.0.1"
+APP_VERSION = "9.0.6"
 CALC_CMD    = "calc.exe"
 CALC_CLASS  = "ApplicationFrameWindow"
 CALC_TITLES = ("Calculator", "Калькулятор")
