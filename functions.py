@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""Базовый функционал CalcNumLock 9.0.7.
+"""Базовый функционал CalcNumLock 9.0.11.
 
 Содержит пути, logging, WinAPI helpers, работу с окнами калькулятора,
 буфером, меню и базовые UI-классы. Платные слои вынесены в pro_soft.py
@@ -204,6 +204,7 @@ SW_RESTORE      = 9
 SW_SHOW         = 5
 VK_NUMLOCK      = 0x90
 KEYEVENTF_KEYUP = 0x0002
+KEYEVENTF_EXTENDEDKEY = 0x0001
 SWP_NOSIZE      = 0x0001
 SWP_NOMOVE      = 0x0002
 SWP_SHOWWINDOW  = 0x0040

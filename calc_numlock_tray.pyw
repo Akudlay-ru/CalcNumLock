@@ -1,4 +1,4 @@
-"""NumLockCalc 2026 release 9.0.7.
+"""NumLockCalc 2026 release 9.0.11.
 
 Free core: встроенный калькулятор, NumLock-hotkey, единицы, буфер,
 история и базовые настройки.
@@ -180,11 +180,12 @@ MANAGED_WINDOWS_AVAILABLE = PRO_SECURE_AVAILABLE
 LICENSE_FILE = APP_ROOT / "license.txt"
 PAID_HIDE_HOURS = 2
 PRODUCT_DISPLAY_NAME = "NumLockCalc 2026"
-PRODUCT_VERSION_LABEL = "9.0.7"
-STARTUP_SHORTCUT_NAME = f"{PRODUCT_DISPLAY_NAME} 9.0.7.lnk"
+PRODUCT_VERSION_LABEL = "9.0.11"
+STARTUP_SHORTCUT_NAME = f"{PRODUCT_DISPLAY_NAME} 9.0.11.lnk"
 KEYBOARD_IDLE_RECOVERY_SEC = 30 * 60
-KEYBOARD_RECOVERY_POLL_MS = 60 * 1000
-NUMLOCK_RESTORE_DELAY_MS = 80
+NUMLOCK_STATE_WATCH_POLL_MS = 100
+KEYBOARD_RECOVERY_POLL_MS = NUMLOCK_STATE_WATCH_POLL_MS
+KEYBOARD_HOTKEY_RECOVERY_POLL_SEC = 60.0
 HWND_BROADCAST = 0xFFFF
 try:
     WM_CALCNUMLOCK_SHOW_CALC = int(ctypes.windll.user32.RegisterWindowMessageW("CalcNumLock.ShowCalculator.v1"))
@@ -936,6 +937,10 @@ class SettingsDialog(QDialog):
         self.chk_numlock_enabled = QCheckBox("Горячая клавиша показывает / скрывает калькулятор")
         self.chk_numlock_enabled.setChecked(self.app.calc_hotkey_enabled)
         f.addRow(self.chk_numlock_enabled)
+
+        self.chk_numlock_always_on = QCheckBox("NumLock всегда включен")
+        self.chk_numlock_always_on.setChecked(bool(getattr(self.app, "numlock_always_on", True)))
+        f.addRow(self.chk_numlock_always_on)
 
 
         self.le_main_hotkey = HotkeyLineEdit(self.app.main_hotkey, self, "num lock")
@@ -1776,9 +1781,12 @@ class SettingsDialog(QDialog):
             return
         # --- Общие ---
         a.calc_hotkey_enabled = self.chk_numlock_enabled.isChecked()
+        a.numlock_always_on = bool(self.chk_numlock_always_on.isChecked())
         a.main_hotkey = next_main_hotkey
         a.calc_pause_hotkey = next_pause_hotkey
         a.main_hotkey_delay_sec = float(self.spn_main_delay.value())
+        if a.numlock_always_on:
+            a._restore_numlock()
         a.calc_open_on_start = bool(self.chk_calc_open_on_start.isChecked())
         a.calc_second_launch_shows_calc = bool(getattr(self, "chk_calc_second_launch_shows_calc", None) and self.chk_calc_second_launch_shows_calc.isChecked())
         a.calc_always_on_top = bool(getattr(self, "chk_calc_always_on_top", None) and self.chk_calc_always_on_top.isChecked())
@@ -2047,6 +2055,7 @@ class CalcTrayApp(QWidget):
         self.session_pos  = None
         self.running      = True
         self.calc_hotkey_enabled = True
+        self.numlock_always_on = True
         self.main_hotkey = "num lock"
         self.calc_pause_hotkey = "shift+num lock"
         self.main_hotkey_delay_sec = 0.15
@@ -2959,6 +2968,7 @@ class CalcTrayApp(QWidget):
         self.opacity_pct = int(data.get("opacity_pct", 100))
         self.pos_mode    = data.get("pos_mode", POS_CENTER)
         self.calc_hotkey_enabled = bool(data.get("calc_hotkey_enabled", True))
+        self.numlock_always_on = bool(data.get("numlock_always_on", True))
         self.main_hotkey = str(data.get("main_hotkey", "num lock") or "num lock").strip().lower()
         self.calc_pause_hotkey = str(data.get("calc_pause_hotkey", data.get("pause_hotkey", "shift+num lock")) or "shift+num lock").strip().lower()
         self.main_hotkey_delay_sec = float(data.get("main_hotkey_delay_sec", 0.15))
@@ -3011,6 +3021,7 @@ class CalcTrayApp(QWidget):
             "opacity_pct": self.opacity_pct,
             "pos_mode": self.pos_mode,
             "calc_hotkey_enabled": self.calc_hotkey_enabled,
+            "numlock_always_on": bool(getattr(self, "numlock_always_on", True)),
             "main_hotkey": self.main_hotkey,
             "calc_pause_hotkey": self.calc_pause_hotkey,
             "main_hotkey_delay_sec": self.main_hotkey_delay_sec,
@@ -3067,6 +3078,7 @@ class CalcTrayApp(QWidget):
         self.pos_mode    = POS_CENTER
         self.session_pos = None
         self.calc_hotkey_enabled = True
+        self.numlock_always_on = True
         self.main_hotkey = "num lock"
         self.calc_pause_hotkey = "shift+num lock"
         self.main_hotkey_delay_sec = 0.15
@@ -4547,6 +4559,12 @@ class CalcTrayApp(QWidget):
     def _poll_keyboard_recovery_watchdog(self) -> None:
         if not bool(getattr(self, "running", False)) or not bool(getattr(self, "_startup_ready", False)):
             return
+        self._restore_numlock()
+        now_ts = time.time()
+        last_hotkey_check_ts = float(getattr(self, "_keyboard_hotkey_watchdog_last_ts", 0.0) or 0.0)
+        if now_ts - last_hotkey_check_ts < KEYBOARD_HOTKEY_RECOVERY_POLL_SEC:
+            return
+        self._keyboard_hotkey_watchdog_last_ts = now_ts
         try:
             idle_sec = float(get_idle_seconds())
         except Exception as e:
@@ -4605,12 +4623,6 @@ class CalcTrayApp(QWidget):
                 hotkey_id = int(msg.wParam)
                 callback = getattr(self, "_native_hotkey_callbacks", {}).get(hotkey_id)
                 role = getattr(self, "_native_hotkey_roles", {}).get(hotkey_id, str(hotkey_id))
-                now = time.time()
-                if callback is not None and role == "calc toggle":
-                    last_fire = float(getattr(self, "_native_hotkey_last_fire", {}).get(hotkey_id, 0.0))
-                    if now - last_fire < 0.25:
-                        return True, 0
-                    self._native_hotkey_last_fire[hotkey_id] = now
                 if callback is not None:
                     log(f"Native hotkey fired: {role}")
                     callback()
@@ -5731,7 +5743,7 @@ class CalcTrayApp(QWidget):
         log(f"Toggle (mode={self.hide_mode})")
         if self._using_builtin_calc():
             self._toggle_builtin_calc()
-            QtCore.QTimer.singleShot(NUMLOCK_RESTORE_DELAY_MS, self._restore_numlock)
+            self._restore_numlock()
             return
         hwnd = self._find_target_hwnd()
         if not hwnd:
@@ -5743,7 +5755,7 @@ class CalcTrayApp(QWidget):
             self._show(hwnd)
         else:
             self._hide(hwnd)
-        QtCore.QTimer.singleShot(NUMLOCK_RESTORE_DELAY_MS, self._restore_numlock)
+        self._restore_numlock()
 
     def _wait_for_calc(self, ms: int = 200, attempts: int = 25):
         self._wait_n = attempts
@@ -5752,7 +5764,7 @@ class CalcTrayApp(QWidget):
             if hwnd:
                 log("Target window appeared")
                 self._show(hwnd)
-                QtCore.QTimer.singleShot(NUMLOCK_RESTORE_DELAY_MS, self._restore_numlock)
+                self._restore_numlock()
             elif self._wait_n > 0:
                 self._wait_n -= 1
                 QtCore.QTimer.singleShot(ms, _check)
@@ -5818,12 +5830,32 @@ class CalcTrayApp(QWidget):
             log(f"Hidden (SW_HIDE + TOOLWINDOW), pos={self.session_pos}")
 
     def _restore_numlock(self):
+        if not bool(getattr(self, "running", False)):
+            return
+        if not bool(getattr(self, "numlock_always_on", True)):
+            return
+        if bool(getattr(self, "_restoring_numlock", False)):
+            return
         try:
-            if not (GetKeyState(VK_NUMLOCK) & 1):
-                keybd_event(VK_NUMLOCK, 0, 0, 0)
-                keybd_event(VK_NUMLOCK, 0, KEYEVENTF_KEYUP, 0)
+            self._restoring_numlock = True
+            if GetKeyState(VK_NUMLOCK) & 1:
+                return
+            hotkey_was_registered = bool(
+                getattr(self, "_native_calc_hotkey_ids", None)
+                or getattr(self, "calc_hotkey_handles", None)
+            )
+            restore_unregistered_hotkeys = False
+            if hotkey_was_registered and normalize_hotkey(getattr(self, "main_hotkey", "num lock")) == "num lock":
+                self._unregister_calc_hotkeys()
+                restore_unregistered_hotkeys = True
+            keybd_event(VK_NUMLOCK, 0x45, KEYEVENTF_EXTENDEDKEY, 0)
+            keybd_event(VK_NUMLOCK, 0x45, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, 0)
+            if restore_unregistered_hotkeys and self.running:
+                self._register_calc_hotkeys()
         except Exception as e:
             log(f"NumLock restore error: {e}")
+        finally:
+            self._restoring_numlock = False
 
     # ------------------------------------------------------------------
     # Делегаты в extra (вызываются из меню/таймеров; пустые без extra)
