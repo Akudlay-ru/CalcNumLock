@@ -44,6 +44,7 @@ ICON_FILE = "calculator_icon.ico"
 CORE_PY_FILES = [
     "calc_numlock_tray.pyw",
     "functions.py",
+    "module_availability.py",
     "numlock_state.py",
     "version.py",
     "hotkey_registry.py",

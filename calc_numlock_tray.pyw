@@ -1,4 +1,4 @@
-"""NumLockCalc 2026 release 10.2.1.
+"""NumLockCalc 2026 release 10.2.2.
 
 Free core: встроенный калькулятор, NumLock-hotkey, единицы, буфер,
 история и базовые настройки.
@@ -60,7 +60,8 @@ from menu_action_row import (
 from note_send_modes import NOTE_SEND_MODE_OBSIDIAN, note_send_mode_options, normalize_note_send_mode
 from note_storage import write_note_entry
 from native_hotkeys import WM_HOTKEY, parse_native_hotkey, should_use_native_hotkey
-from numlock_state import ensure_numlock_on
+from module_availability import module_is_available
+from numlock_state import ensure_numlock_on, schedule_numlock_restore
 
 # ---------------------------------------------------------------------------
 # Профилирование запуска / диагностика зависаний
@@ -174,8 +175,8 @@ pro_soft = None
 pro_secure = None
 extra = None
 managed_windows = None
-PRO_SOFT_AVAILABLE = (APP_ROOT / "pro_soft.py").exists()
-PRO_SECURE_AVAILABLE = (APP_ROOT / "pro_secure.py").exists()
+PRO_SOFT_AVAILABLE = module_is_available("pro_soft", APP_ROOT)
+PRO_SECURE_AVAILABLE = module_is_available("pro_secure", APP_ROOT)
 EXTRA_AVAILABLE = PRO_SECURE_AVAILABLE
 MANAGED_WINDOWS_AVAILABLE = PRO_SECURE_AVAILABLE
 LICENSE_FILE = APP_ROOT / "license.txt"
@@ -184,6 +185,7 @@ PRODUCT_VERSION_LABEL = APP_VERSION
 STARTUP_SHORTCUT_NAME = f"{PRODUCT_DISPLAY_NAME} {APP_VERSION}.lnk"
 KEYBOARD_IDLE_RECOVERY_SEC = 30 * 60
 NUMLOCK_STATE_WATCH_POLL_MS = 100
+NUMLOCK_HOTKEY_REREGISTER_DELAY_MS = 150
 KEYBOARD_RECOVERY_POLL_MS = NUMLOCK_STATE_WATCH_POLL_MS
 KEYBOARD_HOTKEY_RECOVERY_POLL_SEC = 60.0
 HWND_BROADCAST = 0xFFFF
@@ -2036,7 +2038,7 @@ class SettingsDialog(QDialog):
 # ---------------------------------------------------------------------------
 class CalcTrayApp(QWidget):
 
-    _sig_toggle = QtCore.pyqtSignal()
+    _sig_toggle = QtCore.pyqtSignal(bool)
     _sig_note_popup_show = QtCore.pyqtSignal()
     # Автокопирование вызывается из keyboard-hook потока.
     # QTimer.singleShot из чужого потока не обязан сработать, поэтому
@@ -4740,7 +4742,12 @@ class CalcTrayApp(QWidget):
         if not getattr(self, "_startup_ready", False):
             self._pending_startup_toggle = True
             return
-        self._sig_toggle.emit()
+        main_hotkey_is_numlock = normalize_hotkey(getattr(self, "main_hotkey", "num lock")) == "num lock"
+        self._sig_toggle.emit(not main_hotkey_is_numlock)
+        schedule_numlock_restore(
+            lambda delay, callback: QTimer.singleShot(delay, callback),
+            lambda: self._restore_numlock(force_toggle=main_hotkey_is_numlock),
+        )
 
     def _handle_calc_pause_hotkey(self):
         if not self.running:
@@ -5739,11 +5746,12 @@ class CalcTrayApp(QWidget):
             except Exception:
                 pass
 
-    def _do_toggle(self):
+    def _do_toggle(self, restore_numlock: bool = True):
         log(f"Toggle (mode={self.hide_mode})")
         if self._using_builtin_calc():
             self._toggle_builtin_calc()
-            self._restore_numlock()
+            if restore_numlock:
+                self._restore_numlock()
             return
         hwnd = self._find_target_hwnd()
         if not hwnd:
@@ -5755,7 +5763,8 @@ class CalcTrayApp(QWidget):
             self._show(hwnd)
         else:
             self._hide(hwnd)
-        self._restore_numlock()
+        if restore_numlock:
+            self._restore_numlock()
 
     def _wait_for_calc(self, ms: int = 200, attempts: int = 25):
         self._wait_n = attempts
@@ -5829,7 +5838,7 @@ class CalcTrayApp(QWidget):
             ShowWindow(hwnd, SW_HIDE)
             log(f"Hidden (SW_HIDE + TOOLWINDOW), pos={self.session_pos}")
 
-    def _restore_numlock(self):
+    def _restore_numlock(self, force_toggle: bool = False):
         if not bool(getattr(self, "running", False)):
             return
         if bool(getattr(self, "_restoring_numlock", False)):
@@ -5861,6 +5870,9 @@ class CalcTrayApp(QWidget):
                 press_and_release=press_numlock,
                 suspend_hotkey=suspend_numlock_hotkey,
                 resume_hotkey=resume_numlock_hotkey,
+                resume_delay_ms=NUMLOCK_HOTKEY_REREGISTER_DELAY_MS,
+                schedule_resume=lambda delay, callback: QTimer.singleShot(delay, callback),
+                force_toggle=force_toggle,
             )
         except Exception as e:
             log(f"NumLock restore error: {e}")
