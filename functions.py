@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""Базовый функционал CalcNumLock 10.2.2.
+"""Базовый функционал CalcNumLock 10.2.3.
 
 Содержит пути, logging, WinAPI helpers, работу с окнами калькулятора,
 буфером, меню и базовые UI-классы. Платные слои вынесены в pro_soft.py

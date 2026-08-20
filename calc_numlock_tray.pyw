@@ -1,4 +1,4 @@
-"""NumLockCalc 2026 release 10.2.2.
+"""NumLockCalc 2026 release 10.2.3.
 
 Free core: встроенный калькулятор, NumLock-hotkey, единицы, буфер,
 история и базовые настройки.
@@ -60,6 +60,7 @@ from menu_action_row import (
 from note_send_modes import NOTE_SEND_MODE_OBSIDIAN, note_send_mode_options, normalize_note_send_mode
 from note_storage import write_note_entry
 from native_hotkeys import WM_HOTKEY, parse_native_hotkey, should_use_native_hotkey
+from calc_window_geometry import restore_window
 from module_availability import module_is_available
 from numlock_state import ensure_numlock_on, schedule_numlock_restore
 
@@ -5666,7 +5667,7 @@ class CalcTrayApp(QWidget):
 
             self._apply_calc_topmost()
             self._startup_mark("CALC_SHOW_BEGIN")
-            w.show()
+            restore_window(w)
             self._startup_mark("CALC_SHOW_DONE")
 
             def _apply_calc_opacity_deferred(win=w, opacity=opacity_value):
