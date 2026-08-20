@@ -1,4 +1,4 @@
-"""NumLockCalc 2026 release 9.0.11.
+"""NumLockCalc 2026 release 10.2.1.
 
 Free core: встроенный калькулятор, NumLock-hotkey, единицы, буфер,
 история и базовые настройки.
@@ -60,6 +60,7 @@ from menu_action_row import (
 from note_send_modes import NOTE_SEND_MODE_OBSIDIAN, note_send_mode_options, normalize_note_send_mode
 from note_storage import write_note_entry
 from native_hotkeys import WM_HOTKEY, parse_native_hotkey, should_use_native_hotkey
+from numlock_state import ensure_numlock_on
 
 # ---------------------------------------------------------------------------
 # Профилирование запуска / диагностика зависаний
@@ -179,9 +180,8 @@ EXTRA_AVAILABLE = PRO_SECURE_AVAILABLE
 MANAGED_WINDOWS_AVAILABLE = PRO_SECURE_AVAILABLE
 LICENSE_FILE = APP_ROOT / "license.txt"
 PAID_HIDE_HOURS = 2
-PRODUCT_DISPLAY_NAME = "NumLockCalc 2026"
-PRODUCT_VERSION_LABEL = "9.0.11"
-STARTUP_SHORTCUT_NAME = f"{PRODUCT_DISPLAY_NAME} 9.0.11.lnk"
+PRODUCT_VERSION_LABEL = APP_VERSION
+STARTUP_SHORTCUT_NAME = f"{PRODUCT_DISPLAY_NAME} {APP_VERSION}.lnk"
 KEYBOARD_IDLE_RECOVERY_SEC = 30 * 60
 NUMLOCK_STATE_WATCH_POLL_MS = 100
 KEYBOARD_RECOVERY_POLL_MS = NUMLOCK_STATE_WATCH_POLL_MS
@@ -5832,26 +5832,36 @@ class CalcTrayApp(QWidget):
     def _restore_numlock(self):
         if not bool(getattr(self, "running", False)):
             return
-        if not bool(getattr(self, "numlock_always_on", True)):
-            return
         if bool(getattr(self, "_restoring_numlock", False)):
             return
-        try:
-            self._restoring_numlock = True
-            if GetKeyState(VK_NUMLOCK) & 1:
-                return
+
+        def suspend_numlock_hotkey():
             hotkey_was_registered = bool(
                 getattr(self, "_native_calc_hotkey_ids", None)
                 or getattr(self, "calc_hotkey_handles", None)
             )
-            restore_unregistered_hotkeys = False
             if hotkey_was_registered and normalize_hotkey(getattr(self, "main_hotkey", "num lock")) == "num lock":
                 self._unregister_calc_hotkeys()
-                restore_unregistered_hotkeys = True
+                return True
+            return False
+
+        def press_numlock():
             keybd_event(VK_NUMLOCK, 0x45, KEYEVENTF_EXTENDEDKEY, 0)
             keybd_event(VK_NUMLOCK, 0x45, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, 0)
-            if restore_unregistered_hotkeys and self.running:
+
+        def resume_numlock_hotkey():
+            if self.running:
                 self._register_calc_hotkeys()
+
+        try:
+            self._restoring_numlock = True
+            ensure_numlock_on(
+                enabled=bool(getattr(self, "numlock_always_on", True)),
+                is_enabled=lambda: bool(GetKeyState(VK_NUMLOCK) & 1),
+                press_and_release=press_numlock,
+                suspend_hotkey=suspend_numlock_hotkey,
+                resume_hotkey=resume_numlock_hotkey,
+            )
         except Exception as e:
             log(f"NumLock restore error: {e}")
         finally:

@@ -35,13 +35,17 @@ import zipfile
 from datetime import datetime
 from pathlib import Path
 
-APP_BASENAME = "NumLockCalc_2026_9.0.7_FREE_CORE_RELEASE"
+from version import STABLE_EXE_NAME
+
+APP_BASENAME = Path(STABLE_EXE_NAME).stem
 ENTRY_FILE = "calc_numlock_tray.pyw"
 ICON_FILE = "calculator_icon.ico"
 
 CORE_PY_FILES = [
     "calc_numlock_tray.pyw",
     "functions.py",
+    "numlock_state.py",
+    "version.py",
     "hotkey_registry.py",
     "launcher_window_state.py",
     "menu_action_row.py",
